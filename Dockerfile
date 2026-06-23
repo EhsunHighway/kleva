@@ -1,8 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM klee/klee:3.0 AS klee
-
-FROM framac/frama-c:32.1
+FROM klee/klee:3.0
 
 USER root
 
@@ -15,14 +13,11 @@ ENV KLEE_CLANG=/tmp/llvm-130-install_O_D_A/bin/clang
 ENV LLVM_LINK=/tmp/llvm-130-install_O_D_A/bin/llvm-link
 ENV PATH="/opt/kleva/.venv/bin:/home/klee/klee_build/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
 
-COPY --from=klee /home/klee/klee_src /home/klee/klee_src
-COPY --from=klee /home/klee/klee_build /home/klee/klee_build
-COPY --from=klee /tmp/llvm-130-install_O_D_A /tmp/llvm-130-install_O_D_A
-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        frama-c \
         python3 \
         python3-pip \
         python3-venv \
@@ -40,9 +35,9 @@ RUN python3 -m venv /opt/kleva/.venv \
     && /opt/kleva/.venv/bin/python -m pip install --no-cache-dir . \
     && chmod +x /usr/local/bin/kleva-docker-entrypoint \
     && mkdir -p /work \
-    && chown -R opam:opam /opt/kleva /work /home/klee /tmp/llvm-130-install_O_D_A
+    && chown -R klee:klee /opt/kleva /work
 
-USER opam
+USER klee
 WORKDIR /work
 
 ENTRYPOINT ["kleva-docker-entrypoint"]
