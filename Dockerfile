@@ -20,7 +20,10 @@ COPY --from=klee_toolchain /home/klee/klee_build /home/klee/klee_build
 COPY --from=klee_toolchain /tmp/llvm-130-install_O_D_A /tmp/llvm-130-install_O_D_A
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && apt-get -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        install --no-install-recommends \
         build-essential \
         ca-certificates \
         python3 \
