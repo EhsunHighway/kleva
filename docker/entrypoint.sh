@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-exec kleva "$@"
+exec python3 -m kleva.cli "$@"
