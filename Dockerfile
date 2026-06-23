@@ -28,6 +28,8 @@ COPY src ./src
 COPY docker/entrypoint.sh /usr/local/bin/kleva-docker-entrypoint
 
 RUN python3 --version \
+    && python3 -m ensurepip --upgrade \
+    && python3 -m pip install --no-cache-dir --break-system-packages pyyaml \
     && python3 -c "import yaml" \
     && frama-c -version \
     && klee --version \
