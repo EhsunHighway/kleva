@@ -8,15 +8,15 @@ USER root
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV KLEE_HOME=/home/klee/klee_src
-ENV KLEE_BUILD=/tmp/klee_build130stp_z3
+ENV KLEE_BUILD=/home/klee/klee_build
 ENV LLVM_HOME=/tmp/llvm-130-install_O_D_A
 ENV KLEE_INCLUDE=/home/klee/klee_src/include
 ENV KLEE_CLANG=/tmp/llvm-130-install_O_D_A/bin/clang
 ENV LLVM_LINK=/tmp/llvm-130-install_O_D_A/bin/llvm-link
-ENV PATH="/opt/kleva/.venv/bin:/tmp/klee_build130stp_z3/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
+ENV PATH="/opt/kleva/.venv/bin:/home/klee/klee_build/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
 
 COPY --from=klee /home/klee/klee_src /home/klee/klee_src
-COPY --from=klee /tmp/klee_build130stp_z3 /tmp/klee_build130stp_z3
+COPY --from=klee /home/klee/klee_build /home/klee/klee_build
 COPY --from=klee /tmp/llvm-130-install_O_D_A /tmp/llvm-130-install_O_D_A
 
 RUN apt-get update \
@@ -40,7 +40,7 @@ RUN python3 -m venv /opt/kleva/.venv \
     && /opt/kleva/.venv/bin/python -m pip install --no-cache-dir . \
     && chmod +x /usr/local/bin/kleva-docker-entrypoint \
     && mkdir -p /work \
-    && chown -R opam:opam /opt/kleva /work /home/klee /tmp/klee_build130stp_z3 /tmp/llvm-130-install_O_D_A
+    && chown -R opam:opam /opt/kleva /work /home/klee /tmp/llvm-130-install_O_D_A
 
 USER opam
 WORKDIR /work
