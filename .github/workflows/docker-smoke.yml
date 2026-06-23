@@ -26,7 +26,7 @@ jobs:
 
       - name: Check bundled tools
         run: |
-          docker run --rm --ulimit='stack=-1:-1' --entrypoint bash kleva:smoke -lc \
+          docker run --rm --ulimit='stack=-1:-1' --entrypoint bash kleva:smoke -c \
             'klee --version && ktest-tool --help >/dev/null && frama-c -version && kleva --help >/dev/null'
 
       - name: Prepare smoke module
