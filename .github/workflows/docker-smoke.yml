@@ -1,0 +1,48 @@
+name: Docker Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/docker-smoke.yml"
+      - "Dockerfile"
+      - "README.md"
+      - "docker/**"
+      - "docs/**"
+      - "pyproject.toml"
+      - "src/**"
+
+jobs:
+  docker-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t kleva:smoke .
+
+      - name: Check bundled tools
+        run: |
+          docker run --rm --ulimit='stack=-1:-1' --entrypoint bash kleva:smoke -lc \
+            'klee --version && ktest-tool --help >/dev/null && frama-c -version && kleva --help >/dev/null'
+
+      - name: Prepare smoke module
+        run: |
+          mkdir -p /tmp/kleva-smoke
+          cp docker/smoke/lucky.h docker/smoke/lucky.c /tmp/kleva-smoke/
+
+      - name: Run KLEVA on smoke module
+        run: |
+          docker run --rm --ulimit='stack=-1:-1' -v /tmp/kleva-smoke:/work kleva:smoke run lucky.h \
+            --source lucky.c \
+            --include . \
+            --mode all \
+            --base-dir .
+
+      - name: Show generated unit test
+        run: |
+          find /tmp/kleva-smoke -maxdepth 3 -type f -print
+          sed -n '1,220p' /tmp/kleva-smoke/unit/test_lucky_kleva.c

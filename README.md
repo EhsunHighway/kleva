@@ -94,6 +94,50 @@ brew install kleva
 Until then, install KLEVA with `pip` or `pipx` from this repository. The
 external verification tools still need to be installed separately.
 
+## Docker
+
+Build the image from this repository:
+
+```sh
+docker build -t kleva:latest .
+```
+
+Check the CLI:
+
+```sh
+docker run --rm --ulimit='stack=-1:-1' kleva:latest --help
+```
+
+Check the bundled tools:
+
+```sh
+docker run --rm --ulimit='stack=-1:-1' --entrypoint bash kleva:latest -lc \
+  'klee --version && ktest-tool --help >/dev/null && frama-c -version && kleva --help >/dev/null'
+```
+
+Run KLEVA against a local C project by mounting it at `/work`:
+
+```sh
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" kleva:latest run module.h \
+  --source module.c \
+  --include . \
+  --mode all \
+  --base-dir .
+```
+
+The image includes KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA.
+
+A small Docker smoke module lives in `docker/smoke`. After building the image,
+you can run the full pipeline against it:
+
+```sh
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD/docker/smoke:/work" kleva:latest run lucky.h \
+  --source lucky.c \
+  --include . \
+  --mode all \
+  --base-dir .
+```
+
 ## No-YAML Workflow
 
 Use `kleva run` when you want KLEVA to synthesize the test plan in memory and
