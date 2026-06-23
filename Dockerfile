@@ -13,7 +13,8 @@ ENV KLEE_CLANG=/tmp/llvm-130-install_O_D_A/bin/clang
 ENV LLVM_LINK=/tmp/llvm-130-install_O_D_A/bin/llvm-link
 ENV PATH="/opt/kleva/.venv/bin:/home/klee/klee_build/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
 
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list.d/*kitware* \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
