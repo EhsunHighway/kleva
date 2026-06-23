@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
-FROM klee/klee:3.0
+FROM klee/klee:3.0 AS klee_toolchain
+
+FROM framac/frama-c:dev-stripped.debian
 
 USER root
 
@@ -13,12 +15,14 @@ ENV KLEE_CLANG=/tmp/llvm-130-install_O_D_A/bin/clang
 ENV LLVM_LINK=/tmp/llvm-130-install_O_D_A/bin/llvm-link
 ENV PATH="/opt/kleva/.venv/bin:/home/klee/klee_build/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
 
-RUN rm -f /etc/apt/sources.list.d/*kitware* \
-    && apt-get update \
+COPY --from=klee_toolchain /home/klee/klee_src /home/klee/klee_src
+COPY --from=klee_toolchain /home/klee/klee_build /home/klee/klee_build
+COPY --from=klee_toolchain /tmp/llvm-130-install_O_D_A /tmp/llvm-130-install_O_D_A
+
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
-        frama-c \
         python3 \
         python3-pip \
         python3-venv \
@@ -35,6 +39,7 @@ RUN python3 -m venv /opt/kleva/.venv \
     && /opt/kleva/.venv/bin/python -m pip install --upgrade pip \
     && /opt/kleva/.venv/bin/python -m pip install --no-cache-dir . \
     && chmod +x /usr/local/bin/kleva-docker-entrypoint \
+    && if ! id -u klee >/dev/null 2>&1; then useradd -m -s /bin/bash klee; fi \
     && mkdir -p /work \
     && chown -R klee:klee /opt/kleva /work
 
