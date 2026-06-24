@@ -19,6 +19,7 @@ ENV PATH="/home/klee/klee_build/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
 COPY --from=klee_toolchain /home/klee/klee_src /home/klee/klee_src
 COPY --from=klee_toolchain /home/klee/klee_build /home/klee/klee_build
 COPY --from=klee_toolchain /tmp/llvm-130-install_O_D_A /tmp/llvm-130-install_O_D_A
+COPY --from=klee_toolchain /usr/local/lib /usr/local/lib
 
 WORKDIR /opt/kleva
 
@@ -34,6 +35,7 @@ RUN python3 --version \
     && python3 -m pip install --no-cache-dir --break-system-packages pyyaml \
     && rm -f /tmp/get-pip.py \
     && python3 -c "import yaml" \
+    && ldconfig \
     && frama-c -version \
     && klee --version \
     && chmod +x /usr/local/bin/kleva-docker-entrypoint /usr/local/bin/kleva \
