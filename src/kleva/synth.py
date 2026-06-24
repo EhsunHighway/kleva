@@ -44,6 +44,7 @@ SHAPING_FEATURES = {
     "byte-order",
     "loop-tables",
     "state-switches",
+    "callee-success",
 }
 DEFAULT_SHAPING_FEATURES = frozenset(SHAPING_FEATURES)
 
@@ -113,6 +114,15 @@ class BranchCandidate:
     name:     str
     setup:    list[str]
     preamble: list[str] = field(default_factory=list)
+    oracle:   bool = True
+
+
+@dataclass(frozen=True)
+class DerivedLocal:
+    """A local variable computed from another expression in the source body."""
+    kind: str
+    base: str
+    arg:  str
 
 
 @dataclass
@@ -443,6 +453,33 @@ def _function_body(source_text: str | None, func_name: str) -> str:
             depth -= 1
         i += 1
     return source_text[start:i - 1]
+
+
+def _function_definition_body(source_text: str | None, func_name: str) -> str:
+    """Return a body only when `func_name` is found as a C function definition."""
+    if not source_text:
+        return ""
+    text = _strip_comments(source_text)
+    pattern = re.compile(
+        rf"\b(?:static\s+)?(?:inline\s+)?"
+        rf"(?:const\s+)?(?:struct\s+)?\w+(?:\s*\*+)?"
+        rf"\s*{re.escape(func_name)}\s*\([^)]*\)\s*\{{",
+        flags=re.DOTALL,
+    )
+    m = pattern.search(text)
+    if not m:
+        return ""
+
+    start = m.end()
+    depth = 1
+    i = start
+    while i < len(text) and depth:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    return text[start:i - 1]
 
 
 def _function_frees_param(source_text: str | None, func_name: str, param_name: str) -> bool:
@@ -1325,7 +1362,12 @@ def _rewrite_setup_with_param_args(setup: list[str], param_args: dict[str, str])
     for line in setup:
         new_line = line
         for name, arg in sorted(param_args.items(), key=lambda item: len(item[0]), reverse=True):
-            new_line = re.sub(rf"\b{re.escape(name)}\b", arg, new_line)
+            new_line = re.sub(
+                rf"\b{re.escape(name)}->",
+                f"({arg})->",
+                new_line,
+            )
+            new_line = re.sub(rf"(?<![&\w]){re.escape(name)}\b", arg, new_line)
         rewritten.append(new_line)
     return rewritten
 
@@ -1415,8 +1457,84 @@ def _direct_field_aliases(body: str) -> dict[str, tuple[str, str]]:
     return _propagate_local_aliases(body, direct)
 
 
+def _derived_local_aliases(body: str) -> dict[str, DerivedLocal]:
+    derived: dict[str, DerivedLocal] = {}
+    scalar = r"(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)"
+
+    for m in re.finditer(
+        rf"\b{scalar}\s+(\w+)\s*=\s*(\w+)\s*>>\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*;",
+        body,
+    ):
+        local, base, shift = m.groups()
+        derived[local] = DerivedLocal("shr", base, shift)
+
+    for m in re.finditer(
+        rf"\b{scalar}\s+(\w+)\s*=\s*(\w+)\s*&\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*;",
+        body,
+    ):
+        local, base, mask = m.groups()
+        derived[local] = DerivedLocal("and", base, mask)
+
+    for m in re.finditer(
+        rf"\b{scalar}\s+(\w+)\s*=\s*(\w+)->(\w+)\s*-\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*;",
+        body,
+    ):
+        local, obj, field, rhs = m.groups()
+        derived[local] = DerivedLocal("field_sub", f"{obj}->{field}", rhs)
+
+    changed = True
+    while changed:
+        changed = False
+        for m in re.finditer(r"\b(\w+)\s*=\s*(\w+)\s*;", body):
+            dst, src = m.groups()
+            if src in derived and dst not in derived:
+                derived[dst] = derived[src]
+                changed = True
+    return derived
+
+
 def _literal_or_macro_value(value: str) -> bool:
     return bool(re.fullmatch(r"0x[0-9a-fA-F]+|\d+", value)) or value.upper() == value
+
+
+def _field_expr_from_ref(ref: str) -> str | None:
+    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", ref.strip())
+    if m:
+        return f"{m.group(1)}->{m.group(2)}"
+    return None
+
+
+def _setup_local_bitwise_or(
+    local: str,
+    value: str,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal] | None,
+) -> list[str]:
+    derived = (derived_aliases or {}).get(local)
+    if derived and derived.kind == "and":
+        base = derived.base
+        decoded = decoded_aliases.get(base)
+        if decoded:
+            decode_fn, alias, field = decoded
+            if alias in aliases:
+                encode_fn = _host_to_network_fn(decode_fn)
+                if encode_fn:
+                    cast_type, expr = aliases[alias]
+                    target = _cast_field_expr(cast_type, expr, field)
+                    return [f"{target} = {encode_fn}({decode_fn}({target}) | ({value}));"]
+
+        direct = direct_aliases.get(base)
+        if direct and direct[0] in aliases:
+            alias, field = direct
+            cast_type, expr = aliases[alias]
+            target = _cast_field_expr(cast_type, expr, field)
+            return [f"{target} |= ({value});"]
+
+        return _setup_local_value(base, value, aliases, decoded_aliases, direct_aliases, derived_aliases)
+
+    return _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, None)
 
 
 def _setup_local_value(
@@ -1425,7 +1543,26 @@ def _setup_local_value(
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
     direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal] | None = None,
 ) -> list[str]:
+    derived = (derived_aliases or {}).get(local)
+    if derived:
+        if derived.kind == "shr":
+            return _setup_local_value(
+                derived.base,
+                f"(({value}) << {derived.arg})",
+                aliases,
+                decoded_aliases,
+                direct_aliases,
+                derived_aliases,
+            )
+        if derived.kind == "and":
+            return _setup_local_bitwise_or(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases)
+        if derived.kind == "field_sub":
+            target = _field_expr_from_ref(derived.base)
+            if target:
+                return [f"{target} = ({value}) + {derived.arg};"]
+
     decoded = decoded_aliases.get(local)
     if decoded:
         decode_fn, alias, field = decoded
@@ -1450,6 +1587,7 @@ def _good_path_setup_from_source(
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
     direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal] | None = None,
 ) -> list[str]:
     lines: list[str] = []
     seen: set[str] = set()
@@ -1485,7 +1623,18 @@ def _good_path_setup_from_source(
             if not _literal_or_macro_value(rhs):
                 continue
             value = rhs if op == "!=" else rhs
-            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases):
+            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
+                _append_unique(lines, line, seen)
+
+    for local in derived_aliases or {}:
+        for op, rhs in re.findall(
+            rf"\b{re.escape(local)}\s*(!=|==)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            body,
+        ):
+            if not _literal_or_macro_value(rhs):
+                continue
+            value = rhs
+            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
                 _append_unique(lines, line, seen)
 
     return lines
@@ -1496,6 +1645,7 @@ def _loop_table_candidates(
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
     direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal],
     type_catalog: CTypeCatalog | None,
     shaping_features: set[str] | None = None,
 ) -> list[BranchCandidate]:
@@ -1507,7 +1657,7 @@ def _loop_table_candidates(
         return []
 
     candidates: list[BranchCandidate] = []
-    good_setup = _good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases)
+    good_setup = _good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases, derived_aliases)
 
     for alias, (cast_type, expr) in aliases.items():
         pattern = (
@@ -1699,6 +1849,179 @@ def _setup_decoded_local(
     return [f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({value});"]
 
 
+def _split_conjuncts(expr: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}" and depth > 0:
+            depth -= 1
+        if depth == 0 and expr[i:i + 2] == "&&":
+            part = "".join(cur).strip()
+            if part:
+                parts.append(part)
+            cur = []
+            i += 2
+            continue
+        cur.append(ch)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _strip_outer_parens(expr: str) -> str:
+    out = expr.strip()
+    changed = True
+    while changed and out.startswith("(") and out.endswith(")"):
+        changed = False
+        depth = 0
+        balanced_outer = True
+        for i, ch in enumerate(out):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(out) - 1:
+                    balanced_outer = False
+                    break
+        if balanced_outer:
+            out = out[1:-1].strip()
+            changed = True
+    return out
+
+
+def _rewrite_result_expr(
+    expr: str,
+    result_var: str,
+    result_expr: str,
+) -> str:
+    return re.sub(rf"\b{re.escape(result_var)}->", f"{result_expr}.", expr.strip())
+
+
+def _condition_setup_lines(
+    condition: str,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal],
+    result_var: str | None = None,
+    result_expr: str | None = None,
+) -> list[str]:
+    setup: list[str] = []
+    seen: set[str] = set()
+
+    for raw_part in _split_conjuncts(condition):
+        part = _strip_outer_parens(raw_part)
+
+        m = re.fullmatch(r"(\w+)\s*&\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
+        if m:
+            local, value = m.groups()
+            for line in _setup_local_bitwise_or(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
+                _append_unique(setup, line, seen)
+            continue
+
+        m = re.fullmatch(r"!\s*\(\s*(\w+)\s*&\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*\)", part)
+        if m:
+            local, _value = m.groups()
+            for line in _setup_local_value(local, "0", aliases, decoded_aliases, direct_aliases, derived_aliases):
+                _append_unique(setup, line, seen)
+            continue
+
+        m = re.fullmatch(
+            r"(\w+)\s*(==|!=|>|>=|<|<=)\s*([A-Za-z_]\w*(?:->\w+)?|0x[0-9a-fA-F]+|\d+)",
+            part,
+        )
+        if m:
+            local, op, rhs = m.groups()
+            if result_var and result_expr:
+                rhs = _rewrite_result_expr(rhs, result_var, result_expr)
+            if op == "==":
+                value = rhs
+            elif op == "!=":
+                value = _nonmatching_value(rhs)
+            elif op == ">":
+                value = f"(({rhs}) + 1)"
+            elif op == ">=":
+                value = rhs
+            elif op == "<":
+                value = f"(({rhs}) > 0 ? ({rhs}) - 1 : 0)"
+            else:
+                value = rhs
+            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
+                _append_unique(setup, line, seen)
+            continue
+
+        m = re.fullmatch(r"(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
+        if m:
+            local, value = m.groups()
+            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
+                _append_unique(setup, line, seen)
+            continue
+
+    return setup
+
+
+def _condition_function_pointer_setup(
+    condition: str,
+    result_var: str,
+    result_expr: str,
+    result_type: str,
+    type_catalog: CTypeCatalog | None,
+) -> tuple[list[str], list[str]]:
+    """Shape `if (obj->callback)` style guards for function-pointer fields."""
+    if not type_catalog:
+        return [], []
+
+    setup: list[str] = []
+    preamble: list[str] = []
+    seen_setup: set[str] = set()
+    seen_preamble: set[str] = set()
+
+    for raw_part in _split_conjuncts(condition):
+        part = _strip_outer_parens(raw_part)
+        m = re.fullmatch(rf"{re.escape(result_var)}->([A-Za-z_]\w*)", part)
+        if not m:
+            continue
+
+        field = m.group(1)
+        field_param = type_catalog.field_type(result_type, field)
+        if not field_param:
+            continue
+        fp_decl = type_catalog.function_pointer(field_param.base_type)
+        if not fp_decl:
+            continue
+
+        for line in _function_pointer_stub_preamble(fp_decl):
+            _append_unique(preamble, line, seen_preamble)
+        _append_unique(
+            setup,
+            f"{result_expr}.{field} = {_function_pointer_stub_name(fp_decl.name)};",
+            seen_setup,
+        )
+
+    return setup, preamble
+
+
+def _switch_case_blocks(body: str, switch_start: int) -> list[tuple[str, str]]:
+    tail = body[switch_start:]
+    case_iter = list(re.finditer(r"\bcase\s+([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*:", tail))
+    blocks: list[tuple[str, str]] = []
+    for i, m in enumerate(case_iter):
+        start = m.end()
+        end = case_iter[i + 1].start() if i + 1 < len(case_iter) else len(tail)
+        default_m = re.search(r"\bdefault\s*:", tail[start:end])
+        if default_m:
+            end = start + default_m.start()
+        blocks.append((m.group(1), tail[start:end]))
+    return blocks
+
+
 def _lookup_container_setup(
     shape: LookupShape,
     aliases: dict[str, tuple[str, str]],
@@ -1763,6 +2086,7 @@ def _lookup_condition_setup(
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
     direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal],
 ) -> list[str]:
     setup: list[str] = []
     seen: set[str] = set()
@@ -1778,7 +2102,7 @@ def _lookup_condition_setup(
             if rhs in shape.param_args:
                 arg = shape.param_args[rhs]
                 _append_unique(setup, f"{elem}.{field} = {value};", seen)
-                for line in _setup_local_value(arg, value, aliases, decoded_aliases, direct_aliases):
+                for line in _setup_local_value(arg, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
                     _append_unique(setup, line, seen)
             else:
                 _append_unique(setup, f"{elem}.{field} = {rhs};", seen)
@@ -1804,6 +2128,7 @@ def _state_switch_candidates(
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
     direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal],
     type_catalog: CTypeCatalog | None,
     shaping_features: set[str] | None = None,
 ) -> list[BranchCandidate]:
@@ -1816,19 +2141,337 @@ def _state_switch_candidates(
     for shape in _infer_lookup_shape(body, source_text, type_catalog):
         for m in re.finditer(rf"switch\s*\(\s*{re.escape(shape.result_var)}->(\w+)\s*\)", body):
             switch_field = m.group(1)
-            cases = re.findall(r"\bcase\s+([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*:", body[m.end():])
-            for case in cases:
+            for case, case_body in _switch_case_blocks(body, m.end()):
                 setup = []
-                setup.extend(_good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases))
+                setup.extend(_good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases, derived_aliases))
                 setup.extend(_alias_pointer_guard_setup(body, aliases, type_catalog, {shape.container_expr}))
                 setup.extend(_lookup_container_setup(shape, aliases, type_catalog))
-                setup.extend(_lookup_condition_setup(shape, aliases, decoded_aliases, direct_aliases))
+                setup.extend(_lookup_condition_setup(shape, aliases, decoded_aliases, direct_aliases, derived_aliases))
                 container_expr = _expand_alias_expr(shape.container_expr, aliases)
                 setup.append(f"{container_expr}->{shape.array_field}[0].{switch_field} = {case};")
                 candidates.append(BranchCandidate(
                     _safe_c_name(f"source_{shape.result_var}_{switch_field}_{case}"),
                     setup,
                 ))
+                result_expr = f"{container_expr}->{shape.array_field}[0]"
+                for idx, cond in enumerate(re.findall(r"\bif\s*\(([^{};]+)\)", case_body), 1):
+                    cond_setup = _condition_setup_lines(
+                        cond,
+                        aliases,
+                        decoded_aliases,
+                        direct_aliases,
+                        derived_aliases,
+                        shape.result_var,
+                        result_expr,
+                    )
+                    fp_setup, fp_preamble = _condition_function_pointer_setup(
+                        cond,
+                        shape.result_var,
+                        result_expr,
+                        shape.element_type,
+                        type_catalog,
+                    )
+                    if not cond_setup and not fp_setup:
+                        continue
+                    candidates.append(BranchCandidate(
+                        _safe_c_name(f"source_{shape.result_var}_{switch_field}_{case}_guard_{idx}"),
+                        [*setup, *cond_setup, *fp_setup],
+                        fp_preamble,
+                    ))
+
+    return candidates
+
+
+def _is_assignable_expr(expr: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_]\w*(?:->\w+)*", expr.strip()))
+
+
+def _assign_nonzero_if_lvalue(expr: str) -> list[str]:
+    expr = expr.strip()
+    if "->" not in expr or not _is_assignable_expr(expr):
+        return []
+    return [f"if ({expr} == 0) {expr} = 1;"]
+
+
+def _has_field(type_catalog: CTypeCatalog | None, type_name: str, field_name: str, base_type: str | None = None) -> bool:
+    if not type_catalog:
+        return False
+    field = type_catalog.field_type(type_name, field_name)
+    if not field:
+        return False
+    return base_type is None or field.base_type == base_type
+
+
+def _simulator_packet_output_success_setup(
+    sim_expr: str,
+    src_expr: str,
+    dst_expr: str,
+    type_catalog: CTypeCatalog | None,
+) -> tuple[list[str], list[str]]:
+    """
+    Build the small object graph needed by a visible simulator-output callee.
+
+    This is intentionally structural: it checks for the types/fields used by
+    the visible C code instead of keying on one protocol function name.
+    """
+    if not type_catalog:
+        return [], []
+
+    required = (
+        _has_field(type_catalog, "Simulator", "topo", "Topology") and
+        _has_field(type_catalog, "Simulator", "sched", "Scheduler") and
+        _has_field(type_catalog, "Topology", "devices", "Device") and
+        _has_field(type_catalog, "Topology", "dev_count") and
+        _has_field(type_catalog, "Device", "interfaces", "Interface") and
+        _has_field(type_catalog, "Device", "iface_count") and
+        _has_field(type_catalog, "Interface", "ip_addr") and
+        _has_field(type_catalog, "Interface", "up") and
+        _has_field(type_catalog, "Interface", "link", "Link") and
+        _has_field(type_catalog, "Interface", "arp_cache", "ArpCache") and
+        _has_field(type_catalog, "Link", "end_a", "Interface") and
+        _has_field(type_catalog, "Link", "end_b", "Interface") and
+        _has_field(type_catalog, "Link", "up")
+    )
+    if not required:
+        return [], []
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for line in _assign_nonzero_if_lvalue(src_expr):
+        _append_unique(lines, line, seen)
+    for line in _assign_nonzero_if_lvalue(dst_expr):
+        _append_unique(lines, line, seen)
+
+    _append_unique(lines, "Device kleva_success_dev;", seen)
+    _append_unique(lines, "memset(&kleva_success_dev, 0, sizeof(kleva_success_dev));", seen)
+    _append_unique(lines, "Interface kleva_success_iface;", seen)
+    _append_unique(lines, "memset(&kleva_success_iface, 0, sizeof(kleva_success_iface));", seen)
+    _append_unique(lines, "Interface kleva_success_peer;", seen)
+    _append_unique(lines, "memset(&kleva_success_peer, 0, sizeof(kleva_success_peer));", seen)
+    _append_unique(lines, "Interface *kleva_success_ifaces[1] = {&kleva_success_iface};", seen)
+    _append_unique(lines, "Link kleva_success_link;", seen)
+    _append_unique(lines, "memset(&kleva_success_link, 0, sizeof(kleva_success_link));", seen)
+    _append_unique(lines, "ArpCache kleva_success_arp;", seen)
+    _append_unique(lines, "memset(&kleva_success_arp, 0, sizeof(kleva_success_arp));", seen)
+
+    _append_unique(lines, f"if ({sim_expr}->topo) {{ {sim_expr}->topo->devices[0] = &kleva_success_dev; {sim_expr}->topo->dev_count = 1; }}", seen)
+    _append_unique(lines, "kleva_success_dev.interfaces = kleva_success_ifaces;", seen)
+    _append_unique(lines, "kleva_success_dev.iface_count = 1;", seen)
+    _append_unique(lines, "kleva_success_dev.iface_max = 1;", seen)
+    _append_unique(lines, f"kleva_success_iface.ip_addr = ns_htonl({src_expr});", seen)
+    _append_unique(lines, "kleva_success_iface.prefix_len = 0;", seen)
+    _append_unique(lines, "kleva_success_iface.up = 1;", seen)
+    _append_unique(lines, "kleva_success_iface.device = &kleva_success_dev;", seen)
+    _append_unique(lines, "kleva_success_iface.link = &kleva_success_link;", seen)
+    _append_unique(lines, "kleva_success_iface.arp_cache = &kleva_success_arp;", seen)
+    _append_unique(lines, "kleva_success_peer.up = 1;", seen)
+    _append_unique(lines, "kleva_success_link.end_a = &kleva_success_iface;", seen)
+    _append_unique(lines, "kleva_success_link.end_b = &kleva_success_peer;", seen)
+    _append_unique(lines, "kleva_success_link.up = 1;", seen)
+    _append_unique(lines, "kleva_success_arp.entries[0].valid = 1;", seen)
+    _append_unique(lines, f"kleva_success_arp.entries[0].ip_addr = {dst_expr};", seen)
+    _append_unique(lines, "memset(kleva_success_arp.entries[0].mac_addr, 0xA5, sizeof(kleva_success_arp.entries[0].mac_addr));", seen)
+    return lines, ['#include "arp_cache.h"']
+
+
+def _callee_success_setup_for_call(
+    callee: str,
+    args: list[str],
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+) -> tuple[list[str], list[str]]:
+    if not source_text or not type_catalog:
+        return [], []
+
+    function_decls = _function_decl_map(source_text)
+    callee_decl = function_decls.get(callee)
+    callee_body = _function_definition_body(source_text, callee)
+    if not callee_decl or not callee_body or len(args) != len(callee_decl.params):
+        return [], []
+
+    arg_by_param = {p.name: a for p, a in zip(callee_decl.params, args)}
+    for downstream, downstream_args_raw in re.findall(r"\b([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*;", callee_body):
+        downstream_body = _function_definition_body(source_text, downstream)
+        downstream_decl = function_decls.get(downstream)
+        if not downstream_body or not downstream_decl:
+            continue
+        if "ip_find_source_iface" not in downstream_body and "arp_cache_lookup" not in downstream_body:
+            continue
+
+        downstream_args = _split_call_args(downstream_args_raw)
+        if len(downstream_args) < 3:
+            continue
+        mapped = [arg_by_param.get(a.strip(), a.strip()) for a in downstream_args[:3]]
+        sim_expr, src_expr, dst_expr = mapped
+        if not _is_assignable_expr(sim_expr):
+            continue
+        return _simulator_packet_output_success_setup(sim_expr, src_expr, dst_expr, type_catalog)
+
+    return [], []
+
+
+def _return_guard_conditions(prefix: str) -> list[str]:
+    conditions: list[str] = []
+    i = 0
+    while i < len(prefix):
+        m = re.search(r"\bif\s*\(", prefix[i:])
+        if not m:
+            break
+        cond_start = i + m.end()
+        depth = 1
+        j = cond_start
+        while j < len(prefix) and depth > 0:
+            ch = prefix[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            j += 1
+        if depth != 0:
+            break
+
+        condition = prefix[cond_start:j - 1].strip()
+        following = prefix[j:j + 300]
+        if re.match(r"\s*return\b", following) or re.match(r"\s*\{[^{}]*\breturn\b", following, flags=re.DOTALL):
+            conditions.append(condition)
+        i = j
+    return conditions
+
+
+def _invert_simple_return_guard(condition: str, visible_roots: set[str]) -> list[str]:
+    if "||" in condition:
+        return []
+
+    setup: list[str] = []
+    seen: set[str] = set()
+    not_equals_by_field: dict[tuple[str, str], list[str]] = {}
+    parts = [_strip_outer_parens(p) for p in _split_conjuncts(condition)]
+
+    for part in parts:
+        m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
+        if m:
+            obj, field, rhs = m.groups()
+            if obj in visible_roots:
+                not_equals_by_field.setdefault((obj, field), []).append(rhs)
+            continue
+
+        m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
+        if m:
+            obj, field, rhs = m.groups()
+            if obj in visible_roots:
+                _append_unique(setup, f"{obj}->{field} = {_nonmatching_value(rhs)};", seen)
+            continue
+
+        m = re.fullmatch(r"!\s*([A-Za-z_]\w*)->([A-Za-z_]\w*)", part)
+        if m:
+            obj, field = m.groups()
+            if obj in visible_roots:
+                _append_unique(setup, f"{obj}->{field} = 1;", seen)
+            continue
+
+        m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", part)
+        if m:
+            obj, field = m.groups()
+            if obj in visible_roots:
+                _append_unique(setup, f"{obj}->{field} = 0;", seen)
+            continue
+
+        m = re.fullmatch(
+            r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*(<|<=|>|>=)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            part,
+        )
+        if m:
+            obj, field, op, rhs = m.groups()
+            if obj not in visible_roots:
+                continue
+            if op == "<":
+                value = rhs
+            elif op == "<=":
+                value = f"(({rhs}) + 1)"
+            elif op == ">":
+                value = rhs
+            else:
+                value = f"(({rhs}) > 0 ? ({rhs}) - 1 : 0)"
+            _append_unique(setup, f"{obj}->{field} = {value};", seen)
+
+    for (obj, field), values in not_equals_by_field.items():
+        _append_unique(setup, f"{obj}->{field} = {values[0]};", seen)
+
+    return setup
+
+
+def _source_guard_setup_before_call(body: str, call_pos: int, visible_roots: set[str]) -> list[str]:
+    setup: list[str] = []
+    seen: set[str] = set()
+    for condition in _return_guard_conditions(body[:call_pos]):
+        for line in _invert_simple_return_guard(condition, visible_roots):
+            _append_unique(setup, line, seen)
+    return setup
+
+
+def _callee_success_candidates(
+    body: str,
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+    visible_roots: set[str],
+    shaping_features: set[str] | None = None,
+) -> list[BranchCandidate]:
+    if shaping_features is None:
+        shaping_features = set(DEFAULT_SHAPING_FEATURES)
+    if "callee-success" not in shaping_features:
+        return []
+
+    candidates: list[BranchCandidate] = []
+    seen: set[str] = set()
+
+    def visible(expr: str) -> bool:
+        expr = expr.strip()
+        if _literal_or_macro_value(expr):
+            return True
+        m = re.match(r"([A-Za-z_]\w*)", expr)
+        return bool(m and m.group(1) in visible_roots)
+
+    patterns = [
+        re.compile(
+            r"\bint\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;\s*"
+            r"if\s*\(\s*\1\s*==\s*-1\s*\)",
+            flags=re.DOTALL,
+        ),
+        re.compile(
+            r"\bif\s*\(\s*([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*==\s*-1\s*\)",
+            flags=re.DOTALL,
+        ),
+    ]
+
+    for m in patterns[0].finditer(body):
+        _result_var, callee, args_raw = m.groups()
+        args = _split_call_args(args_raw)
+        if not all(visible(arg) for arg in args[:3]):
+            continue
+        setup, preamble = _callee_success_setup_for_call(callee, args, source_text, type_catalog)
+        if not setup:
+            continue
+        guard_setup = _source_guard_setup_before_call(body, m.start(), visible_roots)
+        name = _safe_c_name(f"source_{callee}_success")
+        if name in seen:
+            continue
+        seen.add(name)
+        candidates.append(BranchCandidate(name, [*guard_setup, *setup], preamble))
+
+    for m in patterns[1].finditer(body):
+        callee, args_raw = m.groups()
+        args = _split_call_args(args_raw)
+        if not all(visible(arg) for arg in args[:3]):
+            continue
+        setup, preamble = _callee_success_setup_for_call(callee, args, source_text, type_catalog)
+        if not setup:
+            continue
+        guard_setup = _source_guard_setup_before_call(body, m.start(), visible_roots)
+        name = _safe_c_name(f"source_{callee}_success")
+        if name in seen:
+            continue
+        seen.add(name)
+        candidates.append(BranchCandidate(name, [*guard_setup, *setup], preamble))
 
     return candidates
 
@@ -1870,7 +2513,9 @@ def _source_branch_candidates(
     aliases = _cast_aliases(body, params)
     decoded_aliases = _decoded_field_aliases(body)
     direct_aliases = _direct_field_aliases(body)
+    derived_aliases = _derived_local_aliases(body)
     checksum_fixups = _checksum_recompute_lines(body, aliases)
+    pointer_guard_setup = _alias_pointer_guard_setup(body, aliases, type_catalog, set()) if type_catalog else []
     candidates: list[BranchCandidate] = []
     seen_names: set[str] = set()
 
@@ -1891,7 +2536,7 @@ def _source_branch_candidates(
 
     if "casted-fields" in shaping_features:
         for alias, (cast_type, expr) in aliases.items():
-            backing_setup = _cast_alias_backing_setup(alias, cast_type, expr, params)
+            backing_setup = [*pointer_guard_setup, *_cast_alias_backing_setup(alias, cast_type, expr, params)]
             for m in re.finditer(rf"switch\s*\(\s*{re.escape(alias)}->(\w+)\s*\)", body):
                 field = m.group(1)
                 for case in re.findall(r"\bcase\s+([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*:", body[m.end():]):
@@ -1965,13 +2610,45 @@ def _source_branch_candidates(
                     [f"{target} = {encode_fn}({false_value});"],
                 )
 
-    for candidate in _loop_table_candidates(body, aliases, decoded_aliases, direct_aliases, type_catalog, shaping_features):
+    for p in func.params:
+        if not p.is_pointer or _is_void_star(p):
+            continue
+        field_guards = re.findall(
+            rf"\b{re.escape(p.name)}->(\w+)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            body,
+        )
+        by_field: dict[str, list[str]] = {}
+        for field, value in field_guards:
+            by_field.setdefault(field, []).append(value)
+        for field, values in by_field.items():
+            for value in values:
+                add_candidate(
+                    f"source_{p.name}_{field}_{value}",
+                    [*pointer_guard_setup, f"{p.name}->{field} = {value};"],
+                )
+
+        for field, value in re.findall(
+            rf"\b{re.escape(p.name)}->(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            body,
+        ):
+            add_candidate(
+                f"source_{p.name}_{field}_eq_{value}",
+                [*pointer_guard_setup, f"{p.name}->{field} = {value};"],
+            )
+
+    for candidate in _loop_table_candidates(body, aliases, decoded_aliases, direct_aliases, derived_aliases, type_catalog, shaping_features):
         if candidate.name in seen_names:
             continue
         seen_names.add(candidate.name)
         candidates.append(candidate)
 
-    for candidate in _state_switch_candidates(body, source_text, aliases, decoded_aliases, direct_aliases, type_catalog, shaping_features):
+    for candidate in _state_switch_candidates(body, source_text, aliases, decoded_aliases, direct_aliases, derived_aliases, type_catalog, shaping_features):
+        if candidate.name in seen_names:
+            continue
+        seen_names.add(candidate.name)
+        candidates.append(candidate)
+
+    for candidate in _callee_success_candidates(body, source_text, type_catalog, set(params), shaping_features):
         if candidate.name in seen_names:
             continue
         seen_names.add(candidate.name)
@@ -2378,6 +3055,7 @@ def _emit_yaml_function(
     ktest_dir: str,
     preamble: list[str] | None = None,
     source_include_names: list[str] | None = None,
+    candidate: bool = False,
 ) -> list[str]:
     """Emit YAML lines for one function test entry."""
     preamble = preamble or []
@@ -2407,6 +3085,8 @@ def _emit_yaml_function(
         lines.append(f"    cleanup:   {_emit_str_list(cleanup)}")
     else:
         lines.append("    cleanup:   []")
+    if candidate:
+        lines.append("    candidate: true")
     return lines
 
 
@@ -2626,11 +3306,19 @@ def generate_yaml_from_header(
                             function_decls,
                             extra_setup=candidate.setup,
                             shaping_features=shaping_features,
-                            source_shape_oracle=True,
+                            source_shape_oracle=candidate.oracle,
                         )
                         preamble = [*preamble, *candidate.preamble]
                         lines.extend(_emit_yaml_function(
-                            func, shaped_behavior, body, outputs, cleanup, ktest_dir, preamble, source_include_names
+                            func,
+                            shaped_behavior,
+                            body,
+                            outputs,
+                            cleanup,
+                            ktest_dir,
+                            preamble,
+                            source_include_names,
+                            candidate=True,
                         ))
         else:
             # No ACSL spec: emit a basic test with just function call
