@@ -16,16 +16,13 @@ KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA, so you do not have to
 line up the verification toolchain by hand before trying the tool.
 
 ```sh
-docker pull <dockerhub-namespace>/kleva:latest
-docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" <dockerhub-namespace>/kleva:latest run module.h \
+docker pull ehsunt/kleva:latest
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" ehsunt/kleva:latest run module.h \
   --source module.c \
   --include . \
   --mode all \
   --base-dir .
 ```
-
-Replace `<dockerhub-namespace>` with the Docker Hub namespace that owns the
-published image.
 
 ## What KLEVA Does
 
@@ -121,8 +118,8 @@ The image includes KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA.
 Use the published image from Docker Hub:
 
 ```sh
-docker pull <dockerhub-namespace>/kleva:latest
-docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" <dockerhub-namespace>/kleva:latest run module.h \
+docker pull ehsunt/kleva:latest
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" ehsunt/kleva:latest run module.h \
   --source module.c \
   --include . \
   --mode all \
