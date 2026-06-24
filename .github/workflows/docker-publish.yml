@@ -11,9 +11,7 @@ on:
       - ".dockerignore"
       - ".github/workflows/docker-publish.yml"
       - "Dockerfile"
-      - "README.md"
       - "docker/**"
-      - "docs/**"
       - "pyproject.toml"
       - "src/**"
 
