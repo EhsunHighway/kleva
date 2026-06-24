@@ -24,7 +24,7 @@ COPY --from=klee_toolchain /usr/local/lib /usr/local/lib
 COPY --from=klee_toolchain /usr/lib/x86_64-linux-gnu/libtcmalloc* /usr/local/lib/
 COPY --from=klee_toolchain /tmp/stp-2.3.3-install/lib/libstp.so* /usr/local/lib/
 COPY --from=klee_toolchain /tmp/z3-*-install/lib/libz3.so* /usr/local/lib/
-RUN find / -name 'libminisat*' -o -name '*minisat*'
+RUN find / -name 'libminisat*' -o -name '*minisat*'; false
 
 WORKDIR /opt/kleva
 
