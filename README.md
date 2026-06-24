@@ -5,15 +5,27 @@ It uses KLEE to explore feasible inputs and Frama-C EVA to prove concrete
 output values, then emits C tests with behavior-grounded assertion oracles
 derived from the existing code, contracts, and analysis results.
 
-The short version:
+The short version, with a local install:
 
 ```sh
 kleva run module.h --source module.c --include . --mode all --base-dir .
 ```
 
-Make your life easier and use the Docker image when you can. It bundles KLEVA,
-KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA, so you do not have to line up
-the verification toolchain by hand before trying the tool.
+Make your life easier and use Docker when you can. The Docker image bundles
+KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA, so you do not have to
+line up the verification toolchain by hand before trying the tool.
+
+```sh
+docker pull <dockerhub-namespace>/kleva:latest
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" <dockerhub-namespace>/kleva:latest run module.h \
+  --source module.c \
+  --include . \
+  --mode all \
+  --base-dir .
+```
+
+Replace `<dockerhub-namespace>` with the Docker Hub namespace that owns the
+published image.
 
 ## What KLEVA Does
 
@@ -31,7 +43,10 @@ a guessed oracle.
 
 ## Requirements
 
-KLEVA is a Python package, but it drives external verification tools. You need:
+With Docker, you only need Docker.
+
+For a native install, KLEVA is a Python package, but it drives external
+verification tools. You need:
 
 - Python 3.10 or newer
 - `klee`
@@ -103,16 +118,20 @@ external verification tools still need to be installed separately.
 Make your life easier and use Docker if you want the quickest working setup.
 The image includes KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA.
 
-If the image is published on Docker Hub:
+Use the published image from Docker Hub:
 
 ```sh
-docker pull <dockerhub-user>/kleva:latest
-docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" <dockerhub-user>/kleva:latest run module.h \
+docker pull <dockerhub-namespace>/kleva:latest
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" <dockerhub-namespace>/kleva:latest run module.h \
   --source module.c \
   --include . \
   --mode all \
   --base-dir .
 ```
+
+The mounted directory becomes `/work` inside the container. KLEVA writes its
+generated harnesses, EVA probes, and unit tests back into that mounted project
+directory.
 
 Build the image from this repository:
 
