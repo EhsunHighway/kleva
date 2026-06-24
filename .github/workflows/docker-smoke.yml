@@ -7,9 +7,7 @@ on:
       - ".dockerignore"
       - ".github/workflows/docker-smoke.yml"
       - "Dockerfile"
-      - "README.md"
       - "docker/**"
-      - "docs/**"
       - "pyproject.toml"
       - "src/**"
 
