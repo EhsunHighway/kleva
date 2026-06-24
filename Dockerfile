@@ -26,14 +26,17 @@ COPY pyproject.toml README.md LICENSE ./
 COPY docs ./docs
 COPY src ./src
 COPY docker/entrypoint.sh /usr/local/bin/kleva-docker-entrypoint
+COPY docker/kleva /usr/local/bin/kleva
 
 RUN python3 --version \
-    && python3 -m ensurepip --upgrade \
+    && python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')" \
+    && python3 /tmp/get-pip.py --break-system-packages \
     && python3 -m pip install --no-cache-dir --break-system-packages pyyaml \
+    && rm -f /tmp/get-pip.py \
     && python3 -c "import yaml" \
     && frama-c -version \
     && klee --version \
-    && chmod +x /usr/local/bin/kleva-docker-entrypoint \
+    && chmod +x /usr/local/bin/kleva-docker-entrypoint /usr/local/bin/kleva \
     && mkdir -p /work
 
 WORKDIR /work
