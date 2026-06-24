@@ -38,6 +38,19 @@ five-step pipeline:
 If EVA cannot prove an output value, KLEVA reports it instead of turning it into
 a guessed oracle.
 
+## Status and Feedback
+
+KLEVA is still improving. It uses C syntax and abstract syntax tree analysis to
+work across generic C modules instead of being tailored to one domain-specific
+codebase, so some projects will expose gaps in what it can synthesize or prove.
+Feedback and small reproducible examples are welcome.
+
+KLEVA has been tested on
+[PhosphorFrame](https://github.com/EhsunHighway/PhosphorFrame), a C network
+simulator that models packet flow through Ethernet, ARP, IP, transport
+protocols, routing, devices, links, and events. If you want to see realistic
+ACSL annotations for KLEVA, PhosphorFrame is a good example project to study.
+
 ## Requirements
 
 With Docker, you only need Docker.
