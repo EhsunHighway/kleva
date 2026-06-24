@@ -103,6 +103,17 @@ external verification tools still need to be installed separately.
 Make your life easier and use Docker if you want the quickest working setup.
 The image includes KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA.
 
+If the image is published on Docker Hub:
+
+```sh
+docker pull <dockerhub-user>/kleva:latest
+docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" <dockerhub-user>/kleva:latest run module.h \
+  --source module.c \
+  --include . \
+  --mode all \
+  --base-dir .
+```
+
 Build the image from this repository:
 
 ```sh
