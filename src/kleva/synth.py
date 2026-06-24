@@ -43,6 +43,7 @@ SHAPING_FEATURES = {
     "casted-fields",
     "byte-order",
     "loop-tables",
+    "state-switches",
 }
 DEFAULT_SHAPING_FEATURES = frozenset(SHAPING_FEATURES)
 
@@ -262,7 +263,44 @@ def _parse_function_decls(raw_text: str) -> list[CFunction]:
 
 
 def _function_decl_map(text: str) -> dict[str, CFunction]:
-    return {f.name: f for f in _parse_function_decls(text)}
+    decls = {f.name: f for f in _parse_function_decls(text)}
+    decls.update(_parse_function_definitions(text))
+    return decls
+
+
+def _parse_function_definitions(raw_text: str) -> dict[str, CFunction]:
+    text = _strip_comments(raw_text)
+    text = re.sub(r"__attribute__\s*\(\([^)]*\)\)", "", text)
+    pattern = re.compile(
+        r"\b(?:static\s+)?(?:inline\s+)?"
+        r"((?:const\s+)?(?:struct\s+)?\w+(?:\s*\*+)?)"
+        r"\s*(\w+)\s*\(([^)]*)\)\s*\{",
+        flags=re.DOTALL,
+    )
+
+    funcs: dict[str, CFunction] = {}
+    for m in pattern.finditer(text):
+        ret_raw, fname, args_raw = m.groups()
+        if fname in {"if", "for", "while", "switch"}:
+            continue
+        params: list[CParam] = []
+        args_raw = args_raw.strip()
+        if args_raw and args_raw != "void":
+            for i, p_raw in enumerate(_split_call_args(args_raw)):
+                p = _parse_param(p_raw, i)
+                if p:
+                    params.append(p)
+
+        ret_is_ptr = "*" in ret_raw
+        ret_clean = re.sub(r"[\*\s]", "", ret_raw.replace("const", "").replace("struct", "")).strip()
+        funcs[fname] = CFunction(
+            name=fname,
+            return_type=ret_raw.strip(),
+            return_base=ret_clean,
+            return_is_pointer=ret_is_ptr,
+            params=params,
+        )
+    return funcs
 
 
 # ── Constructor / free pattern inference ──────────────────────────────────────
@@ -379,10 +417,23 @@ def _visible_function(name: str, source_text: str | None) -> bool:
 def _function_body(source_text: str | None, func_name: str) -> str:
     if not source_text:
         return ""
-    m = re.search(rf"\b\w+(?:\s*\*)?\s+{re.escape(func_name)}\s*\([^)]*\)\s*\{{", source_text)
-    if not m:
+    start = -1
+    name_pat = re.compile(rf"\b{re.escape(func_name)}\s*\(")
+    for m in name_pat.finditer(source_text):
+        line_prefix = source_text[source_text.rfind("\n", 0, m.start()) + 1:m.start()]
+        if ";" in line_prefix:
+            continue
+        close = source_text.find(")", m.end())
+        if close == -1:
+            continue
+        brace = source_text.find("{", close)
+        semi = source_text.find(";", close)
+        if brace == -1 or (semi != -1 and semi < brace):
+            continue
+        start = brace + 1
+        break
+    if start == -1:
         return ""
-    start = m.end()
     depth = 1
     i = start
     while i < len(source_text) and depth:
@@ -1295,6 +1346,17 @@ def _cast_field_expr(cast_type: str, expr: str, field: str) -> str:
     return f"(({cast_type} *){expr})->{field}"
 
 
+def _expand_alias_expr(expr: str, aliases: dict[str, tuple[str, str]]) -> str:
+    expanded = expr.strip()
+    for alias, (cast_type, cast_expr) in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+        expanded = re.sub(
+            rf"\b{re.escape(alias)}\b",
+            f"(({cast_type} *){cast_expr})",
+            expanded,
+        )
+    return expanded
+
+
 def _cast_alias_backing_setup(alias: str, cast_type: str, expr: str, params: dict[str, CParam]) -> list[str]:
     m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", expr.strip())
     if not m:
@@ -1311,6 +1373,26 @@ def _cast_alias_backing_setup(alias: str, cast_type: str, expr: str, params: dic
     ]
 
 
+def _propagate_local_aliases(body: str, aliases: dict) -> dict:
+    changed = True
+    while changed:
+        changed = False
+        for m in re.finditer(
+            r"\b(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)\s+(\w+)\s*=\s*(\w+)\s*;",
+            body,
+        ):
+            dst, src = m.groups()
+            if src in aliases and dst not in aliases:
+                aliases[dst] = aliases[src]
+                changed = True
+        for m in re.finditer(r"\b(\w+)\s*=\s*(\w+)\s*;", body):
+            dst, src = m.groups()
+            if src in aliases and dst not in aliases:
+                aliases[dst] = aliases[src]
+                changed = True
+    return aliases
+
+
 def _decoded_field_aliases(body: str) -> dict[str, tuple[str, str, str]]:
     decoded: dict[str, tuple[str, str, str]] = {}
     for m in re.finditer(
@@ -1319,13 +1401,55 @@ def _decoded_field_aliases(body: str) -> dict[str, tuple[str, str, str]]:
     ):
         local, fn, alias, field = m.groups()
         decoded[local] = (fn, alias, field)
-    return decoded
+    return _propagate_local_aliases(body, decoded)
+
+
+def _direct_field_aliases(body: str) -> dict[str, tuple[str, str]]:
+    direct: dict[str, tuple[str, str]] = {}
+    for m in re.finditer(
+        r"\b(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)\s+(\w+)\s*=\s*(\w+)->(\w+)\s*;",
+        body,
+    ):
+        local, alias, field = m.groups()
+        direct[local] = (alias, field)
+    return _propagate_local_aliases(body, direct)
+
+
+def _literal_or_macro_value(value: str) -> bool:
+    return bool(re.fullmatch(r"0x[0-9a-fA-F]+|\d+", value)) or value.upper() == value
+
+
+def _setup_local_value(
+    local: str,
+    value: str,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+) -> list[str]:
+    decoded = decoded_aliases.get(local)
+    if decoded:
+        decode_fn, alias, field = decoded
+        if alias in aliases:
+            encode_fn = _host_to_network_fn(decode_fn)
+            if encode_fn:
+                cast_type, expr = aliases[alias]
+                return [f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({value});"]
+
+    direct = direct_aliases.get(local)
+    if direct:
+        alias, field = direct
+        if alias in aliases:
+            cast_type, expr = aliases[alias]
+            return [f"{_cast_field_expr(cast_type, expr, field)} = {value};"]
+
+    return []
 
 
 def _good_path_setup_from_source(
     body: str,
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
 ) -> list[str]:
     lines: list[str] = []
     seen: set[str] = set()
@@ -1348,8 +1472,21 @@ def _good_path_setup_from_source(
             rf"\b{re.escape(local)}\s*(<|>)\s*([A-Za-z_]\w*(?:->\w+)?|0x[0-9a-fA-F]+|\d+)",
             body,
         ):
+            if not _literal_or_macro_value(rhs):
+                continue
             false_value = rhs
             _append_unique(lines, f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({false_value});", seen)
+
+    for local in [*decoded_aliases.keys(), *direct_aliases.keys()]:
+        for op, rhs in re.findall(
+            rf"\b{re.escape(local)}\s*(!=|==)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            body,
+        ):
+            if not _literal_or_macro_value(rhs):
+                continue
+            value = rhs if op == "!=" else rhs
+            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases):
+                _append_unique(lines, line, seen)
 
     return lines
 
@@ -1358,6 +1495,7 @@ def _loop_table_candidates(
     body: str,
     aliases: dict[str, tuple[str, str]],
     decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
     type_catalog: CTypeCatalog | None,
     shaping_features: set[str] | None = None,
 ) -> list[BranchCandidate]:
@@ -1369,7 +1507,7 @@ def _loop_table_candidates(
         return []
 
     candidates: list[BranchCandidate] = []
-    good_setup = _good_path_setup_from_source(body, aliases, decoded_aliases)
+    good_setup = _good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases)
 
     for alias, (cast_type, expr) in aliases.items():
         pattern = (
@@ -1443,6 +1581,258 @@ def _loop_table_candidates(
     return candidates
 
 
+def _split_call_args(args: str) -> list[str]:
+    out: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    for ch in args:
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}" and depth > 0:
+            depth -= 1
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+@dataclass
+class LookupShape:
+    callee:         str
+    result_var:     str
+    element_type:   str
+    element_alias:  str
+    container_type: str
+    container_expr: str
+    array_field:    str
+    param_args:     dict[str, str]
+    conditions:     list[str]
+
+
+def _infer_lookup_shape(
+    caller_body: str,
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+) -> list[LookupShape]:
+    if not source_text or not type_catalog:
+        return []
+
+    shapes: list[LookupShape] = []
+    function_decls = _function_decl_map(source_text)
+
+    call_pat = re.compile(
+        r"\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*"
+        r"([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;"
+    )
+    for m in call_pat.finditer(caller_body):
+        result_type, result_var, callee, args_raw = m.groups()
+        if not re.search(rf"\bswitch\s*\(\s*{re.escape(result_var)}->\w+\s*\)", caller_body):
+            continue
+
+        callee_body = _function_body(source_text, callee)
+        callee_decl = function_decls.get(callee)
+        if not callee_body or not callee_decl:
+            continue
+
+        args = _split_call_args(args_raw)
+        if len(args) != len(callee_decl.params):
+            continue
+        param_args = {p.name: a for p, a in zip(callee_decl.params, args)}
+
+        alias_pat = re.compile(
+            r"\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*&"
+            r"\s*([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*\[\s*[A-Za-z_]\w*\s*\]\s*;"
+        )
+        for a in alias_pat.finditer(callee_body):
+            element_type, element_alias, container_param, array_field = a.groups()
+            if element_type != result_type:
+                continue
+            if not re.search(rf"\breturn\s+{re.escape(element_alias)}\s*;", callee_body):
+                continue
+            container_decl = next((p for p in callee_decl.params if p.name == container_param), None)
+            if not container_decl:
+                continue
+            container_expr = param_args.get(container_param)
+            if not container_expr:
+                continue
+
+            conditions: list[str] = []
+            for cond in re.findall(rf"{re.escape(element_alias)}->[^{{;]+", callee_body):
+                conditions.append(cond.strip())
+
+            shapes.append(LookupShape(
+                callee=callee,
+                result_var=result_var,
+                element_type=element_type,
+                element_alias=element_alias,
+                container_type=container_decl.base_type,
+                container_expr=container_expr,
+                array_field=array_field,
+                param_args=param_args,
+                conditions=conditions,
+            ))
+
+    return shapes
+
+
+def _setup_decoded_local(
+    local: str,
+    value: str,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+) -> list[str]:
+    decoded = decoded_aliases.get(local)
+    if not decoded:
+        return []
+    decode_fn, alias, field = decoded
+    if alias not in aliases:
+        return []
+    encode_fn = _host_to_network_fn(decode_fn)
+    if not encode_fn:
+        return []
+    cast_type, expr = aliases[alias]
+    return [f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({value});"]
+
+
+def _lookup_container_setup(
+    shape: LookupShape,
+    aliases: dict[str, tuple[str, str]],
+    type_catalog: CTypeCatalog,
+) -> list[str]:
+    raw_expr = shape.container_expr.strip()
+    expr = _expand_alias_expr(raw_expr, aliases)
+    storage = _safe_c_name(f"kleva_{shape.result_var}_{shape.array_field}_owner")
+    setup = [
+        f"{shape.container_type} {storage};",
+        f"memset(&{storage}, 0, sizeof({storage}));",
+    ]
+
+    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", raw_expr)
+    if m and m.group(1) in aliases:
+        alias, field = m.groups()
+        cast_type, cast_expr = aliases[alias]
+        backing = _cast_alias_backing_setup(alias, cast_type, cast_expr, {})
+        setup.extend(backing)
+        setup.append(f"{_cast_field_expr(cast_type, cast_expr, field)} = &{storage};")
+        return setup
+
+    if re.fullmatch(r"[A-Za-z_]\w*", expr):
+        setup.append(f"{expr} = &{storage};")
+    return setup
+
+
+def _alias_pointer_guard_setup(
+    body: str,
+    aliases: dict[str, tuple[str, str]],
+    type_catalog: CTypeCatalog,
+    skip_exprs: set[str] | None = None,
+) -> list[str]:
+    setup: list[str] = []
+    seen: set[str] = set()
+    skip_exprs = skip_exprs or set()
+
+    for alias, (cast_type, cast_expr) in aliases.items():
+        for field in re.findall(rf"!\s*{re.escape(alias)}->(\w+)", body):
+            raw_expr = f"{alias}->{field}"
+            if raw_expr in skip_exprs:
+                continue
+
+            field_param = type_catalog.field_type(cast_type, field)
+            if not field_param or not field_param.is_pointer:
+                continue
+
+            target = _cast_field_expr(cast_type, cast_expr, field)
+            if type_catalog.is_complete_struct(field_param.base_type):
+                storage = _safe_c_name(f"kleva_{alias}_{field}_guard")
+                _append_unique(setup, f"{field_param.base_type} {storage};", seen)
+                _append_unique(setup, f"memset(&{storage}, 0, sizeof({storage}));", seen)
+                _append_unique(setup, f"{target} = &{storage};", seen)
+            else:
+                _append_unique(setup, f"{target} = ({field_param.base_type} *)1;", seen)
+
+    return setup
+
+
+def _lookup_condition_setup(
+    shape: LookupShape,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+) -> list[str]:
+    setup: list[str] = []
+    seen: set[str] = set()
+    container_expr = _expand_alias_expr(shape.container_expr, aliases)
+    elem = f"{container_expr}->{shape.array_field}[0]"
+
+    for cond in shape.conditions:
+        for field, rhs in re.findall(
+            rf"{re.escape(shape.element_alias)}->(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            cond,
+        ):
+            value = "1"
+            if rhs in shape.param_args:
+                arg = shape.param_args[rhs]
+                _append_unique(setup, f"{elem}.{field} = {value};", seen)
+                for line in _setup_local_value(arg, value, aliases, decoded_aliases, direct_aliases):
+                    _append_unique(setup, line, seen)
+            else:
+                _append_unique(setup, f"{elem}.{field} = {rhs};", seen)
+
+        for field in re.findall(
+            rf"{re.escape(shape.element_alias)}->(\w+)(?:\s*&&|\s*\)|\s*$)",
+            cond,
+        ):
+            _append_unique(setup, f"{elem}.{field} = 1;", seen)
+
+        for field, rhs in re.findall(
+            rf"{re.escape(shape.element_alias)}->(\w+)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            cond,
+        ):
+            _append_unique(setup, f"{elem}.{field} = {_nonmatching_value(rhs)};", seen)
+
+    return setup
+
+
+def _state_switch_candidates(
+    body: str,
+    source_text: str | None,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+    type_catalog: CTypeCatalog | None,
+    shaping_features: set[str] | None = None,
+) -> list[BranchCandidate]:
+    if shaping_features is None:
+        shaping_features = set(DEFAULT_SHAPING_FEATURES)
+    if "state-switches" not in shaping_features or not type_catalog:
+        return []
+
+    candidates: list[BranchCandidate] = []
+    for shape in _infer_lookup_shape(body, source_text, type_catalog):
+        for m in re.finditer(rf"switch\s*\(\s*{re.escape(shape.result_var)}->(\w+)\s*\)", body):
+            switch_field = m.group(1)
+            cases = re.findall(r"\bcase\s+([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*:", body[m.end():])
+            for case in cases:
+                setup = []
+                setup.extend(_good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases))
+                setup.extend(_alias_pointer_guard_setup(body, aliases, type_catalog, {shape.container_expr}))
+                setup.extend(_lookup_container_setup(shape, aliases, type_catalog))
+                setup.extend(_lookup_condition_setup(shape, aliases, decoded_aliases, direct_aliases))
+                container_expr = _expand_alias_expr(shape.container_expr, aliases)
+                setup.append(f"{container_expr}->{shape.array_field}[0].{switch_field} = {case};")
+                candidates.append(BranchCandidate(
+                    _safe_c_name(f"source_{shape.result_var}_{switch_field}_{case}"),
+                    setup,
+                ))
+
+    return candidates
+
+
 def _host_to_network_fn(decode_fn: str) -> str:
     if decode_fn in {"ns_ntohs", "ntohs"}:
         return "ns_htons"
@@ -1479,6 +1869,7 @@ def _source_branch_candidates(
     params = {p.name: p for p in func.params}
     aliases = _cast_aliases(body, params)
     decoded_aliases = _decoded_field_aliases(body)
+    direct_aliases = _direct_field_aliases(body)
     checksum_fixups = _checksum_recompute_lines(body, aliases)
     candidates: list[BranchCandidate] = []
     seen_names: set[str] = set()
@@ -1492,7 +1883,9 @@ def _source_branch_candidates(
 
     def rhs_visible_in_harness(rhs: str) -> bool:
         if "->" not in rhs:
-            return True
+            if rhs in params or rhs in aliases:
+                return True
+            return _literal_or_macro_value(rhs)
         base = rhs.split("->", 1)[0].strip()
         return base in params or base in aliases
 
@@ -1572,7 +1965,13 @@ def _source_branch_candidates(
                     [f"{target} = {encode_fn}({false_value});"],
                 )
 
-    for candidate in _loop_table_candidates(body, aliases, decoded_aliases, type_catalog, shaping_features):
+    for candidate in _loop_table_candidates(body, aliases, decoded_aliases, direct_aliases, type_catalog, shaping_features):
+        if candidate.name in seen_names:
+            continue
+        seen_names.add(candidate.name)
+        candidates.append(candidate)
+
+    for candidate in _state_switch_candidates(body, source_text, aliases, decoded_aliases, direct_aliases, type_catalog, shaping_features):
         if candidate.name in seen_names:
             continue
         seen_names.add(candidate.name)
@@ -1732,6 +2131,7 @@ def _gen_valid_setup_body(
     function_decls: dict[str, CFunction] | None = None,
     extra_setup: list[str] | None = None,
     shaping_features: set[str] | None = None,
+    source_shape_oracle: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """
     Generate (body_lines, output_vars, cleanup_lines) for a valid-path test.
@@ -1815,7 +2215,12 @@ def _gen_valid_setup_body(
 
     args_str = ", ".join(call_args)
 
-    if func.return_type.strip() not in ("void", ""):
+    if source_shape_oracle:
+        lines.append(f"{func.name}({args_str});")
+        out_var = "out_ok"
+        lines.append(f"int {out_var} = 1;")
+        outputs.append(out_var)
+    elif func.return_type.strip() not in ("void", ""):
         out_var = "out_ret"
         lines.append(f"{func.return_type} {out_var} = {func.name}({args_str});")
         if func.return_is_pointer:
@@ -2221,6 +2626,7 @@ def generate_yaml_from_header(
                             function_decls,
                             extra_setup=candidate.setup,
                             shaping_features=shaping_features,
+                            source_shape_oracle=True,
                         )
                         preamble = [*preamble, *candidate.preamble]
                         lines.extend(_emit_yaml_function(
