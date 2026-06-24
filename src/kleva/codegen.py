@@ -216,25 +216,30 @@ def write_unit_tests(
     path:                str,
     header:              str,
     ts:                  str | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
     Write the unit test C file.
-    Returns (total_proven_assertions, total_unproven).
+    Returns (total_proven_assertions, total_unproven, skipped_candidates).
 
     A configured output without an EVA singleton is a hard failure. Emitting a
     unit test that only executes code and prints PASS would give a false sense
-    of verification.
+    of verification. Optional candidates are different: they are search goals
+    and are omitted unless EVA proves every requested oracle.
     """
     ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bodies:   list[str] = []
     fn_names: list[str] = []
-    total_proven = total_unproven = 0
+    total_proven = total_unproven = skipped_candidates = 0
 
     for r in recipes:
         probe_fn   = "probe_" + r.fn_id
         singletons = singletons_by_probe.get(probe_fn, {})
         body, fn, proven, unproven = _unit_fn(r, singletons)
         if unproven:
+            if r.candidate:
+                total_unproven += len(unproven)
+                skipped_candidates += 1
+                continue
             missing = ", ".join(unproven)
             raise ValueError(
                 f"EVA did not prove singleton(s) for {r.fn_id}: {missing}"
@@ -260,7 +265,7 @@ def write_unit_tests(
         f.write('\n    printf("\\nAll unit tests passed.\\n");\n')
         f.write("    return 0;\n}\n")
 
-    return total_proven, total_unproven
+    return total_proven, total_unproven, skipped_candidates
 
 
 # ── KLEE harness writer ───────────────────────────────────────────────────────

@@ -183,6 +183,7 @@ class FunctionSpec:
     cleanup:   list[str]
     pure:      bool = False    # no heap → schedule before heap functions in EVA main()
     preamble:  list[str] = field(default_factory=list)  # top-level C declarations before main()
+    candidate: bool = False    # optional generated path; only emitted if EVA proves all outputs
 
 
 @dataclass
@@ -268,6 +269,7 @@ def _config_from_data(data: dict[str, Any]) -> ModuleConfig:
             cleanup   = fn_data.get("cleanup",  []),
             pure      = fn_data.get("pure",     False),
             preamble  = fn_data.get("preamble", []),
+            candidate = fn_data.get("candidate", False),
         ))
 
     return cfg

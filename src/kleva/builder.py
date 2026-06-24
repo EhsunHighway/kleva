@@ -133,6 +133,7 @@ def build_recipe(
         cleanup    = spec.cleanup,
         outputs    = spec.outputs,
         preamble   = spec.preamble,
+        candidate  = spec.candidate,
     )
 
 

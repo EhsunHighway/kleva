@@ -39,6 +39,7 @@ class Recipe:
     cleanup:    list[str]    # statements appended after body (free calls, etc.)
     outputs:    list[str]    # local variable names EVA should prove as singletons
     preamble:   list[str] = field(default_factory=list)  # top-level C before the test fn
+    candidate:  bool = False  # optional generated recipe; skip if EVA cannot prove all outputs
 
 
 # ── guard marker regex patterns ───────────────────────────────────────────────

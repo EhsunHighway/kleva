@@ -271,7 +271,8 @@ def _print_result(result: dict) -> None:
     print(
         f"\nkleva done: {result['recipes']} test vectors  |  "
         f"{result['proven']} EVA-proven assertions  |  "
-        f"{result['unproven']} unproven\n"
+        f"{result['unproven']} unproven  |  "
+        f"{result.get('skipped_candidates', 0)} skipped candidates\n"
         f"  probe → {result['probe_file']}\n"
         f"  tests → {result['unit_file']}"
     )

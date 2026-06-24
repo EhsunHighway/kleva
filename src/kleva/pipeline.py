@@ -148,19 +148,24 @@ def run_pipeline(
     # ── Phase 5: write unit tests ──────────────────────────────────────────────
     log("=== Phase 5: generating unit tests ===")
     unit_path = _resolve(base_dir, cfg.unit_file)
-    proven, unproven = write_unit_tests(
+    proven, unproven, skipped_candidates = write_unit_tests(
         all_recipes,
         probe_singletons,
         unit_path,
         cfg.module_header,
         ts,
     )
-    log(f"  wrote: {unit_path} ({proven} EVA-proven assertions, {unproven} unproven)")
+    log(
+        f"  wrote: {unit_path} "
+        f"({proven} EVA-proven assertions, {unproven} unproven, "
+        f"{skipped_candidates} skipped candidate recipes)"
+    )
 
     return {
         "recipes":    len(all_recipes),
         "proven":     proven,
         "unproven":   unproven,
+        "skipped_candidates": skipped_candidates,
         "probe_file": probe_path,
         "unit_file":  unit_path,
     }
