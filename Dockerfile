@@ -34,6 +34,9 @@ COPY docker/entrypoint.sh /usr/local/bin/kleva-docker-entrypoint
 COPY docker/kleva /usr/local/bin/kleva
 
 RUN python3 --version \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libgoogle-perftools4 \
+    && rm -rf /var/lib/apt/lists/* \
     && python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')" \
     && python3 /tmp/get-pip.py --break-system-packages \
     && python3 -m pip install --no-cache-dir --break-system-packages pyyaml \
