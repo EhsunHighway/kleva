@@ -20,6 +20,7 @@ COPY --from=klee_toolchain /home/klee/klee_src /home/klee/klee_src
 COPY --from=klee_toolchain /home/klee/klee_build /home/klee/klee_build
 COPY --from=klee_toolchain /tmp/llvm-130-install_O_D_A /tmp/llvm-130-install_O_D_A
 COPY --from=klee_toolchain /usr/local/lib /usr/local/lib
+COPY --from=klee_toolchain /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4* /usr/lib/x86_64-linux-gnu/
 COPY --from=klee_toolchain /tmp/stp-2.3.3-install/lib/libstp.so* /usr/local/lib/
 COPY --from=klee_toolchain /tmp/z3-*-install/lib/libz3.so* /usr/local/lib/
 
