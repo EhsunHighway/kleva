@@ -38,6 +38,11 @@ five-step pipeline:
 If EVA cannot prove an output value, KLEVA reports it instead of turning it into
 a guessed oracle.
 
+When that happens, the YAML workflow is the place to investigate and add user
+intent. A YAML plan can make scenarios, states, includes, rules, and generation
+choices explicit, so you can narrow the case that failed, adjust what KLEVA
+should explore, and rerun the pipeline without relying on guessed assertions.
+
 When a function under test needs a callee, callback, or dependency that is not
 implemented yet or is not available inside the test boundary, KLEVA can generate
 spy/stub code for supported scenarios so the interaction can still be exercised
@@ -228,7 +233,9 @@ kleva run module.h \
 
 ## YAML Workflow
 
-Use `kleva synth` when you want to write and inspect a YAML plan first:
+Use `kleva synth` when you want to write and inspect a YAML plan first. This is
+also the recommended path when EVA cannot prove an output value and you want to
+understand or refine the scenario before generating tests:
 
 ```sh
 kleva synth path/to/module.h \
@@ -249,6 +256,12 @@ Run phases separately:
 kleva klee kleva/module.yaml --base-dir .
 kleva gen  kleva/module.yaml --base-dir .
 ```
+
+The YAML format is still evolving. Today it is useful for making KLEVA's
+generated plan visible, adding project-specific rules, and rerunning smaller
+pieces of the pipeline. The goal is to make this friendlier over time, especially
+for cases where a proof fails and the user needs to inspect the scenario, add
+missing intent, or decide which behavior should become part of the test.
 
 ## Augment Rules
 
