@@ -2,6 +2,8 @@
 
 FROM klee/klee:3.0 AS klee_toolchain
 
+RUN find / -name 'libstp*' -print
+
 FROM framac/frama-c:dev-stripped.debian
 
 USER root
@@ -37,6 +39,8 @@ RUN python3 --version \
     && rm -f /tmp/get-pip.py \
     && python3 -c "import yaml" \
     && ldconfig \
+    && find / -name 'libstp*' -print \
+    && ls -l /usr/lib/x86_64-linux-gnu/libstp* \
     && frama-c -version \
     && klee --version \
     && chmod +x /usr/local/bin/kleva-docker-entrypoint /usr/local/bin/kleva \
