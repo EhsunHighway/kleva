@@ -100,15 +100,16 @@ pipx install .
 
 ## Homebrew
 
-If a Homebrew tap is available, install KLEVA with:
+Install KLEVA from the Homebrew tap:
 
 ```sh
-brew tap <owner>/kleva
+brew tap EhsunHighway/kleva
 brew install kleva
 ```
 
-Until then, install KLEVA with `pip` or `pipx` from this repository. The
-external verification tools still need to be installed separately.
+The Homebrew formula installs the `kleva` Python CLI. For the full generation
+pipeline, KLEE, `ktest-tool`, and Frama-C EVA still need to be available on
+`PATH`.
 
 ## Docker
 
