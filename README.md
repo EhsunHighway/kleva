@@ -11,6 +11,10 @@ The short version:
 kleva run module.h --source module.c --include . --mode all --base-dir .
 ```
 
+Make your life easier and use the Docker image when you can. It bundles KLEVA,
+KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA, so you do not have to line up
+the verification toolchain by hand before trying the tool.
+
 ## What KLEVA Does
 
 KLEVA generates both test inputs and expected-output assertions. It runs a
@@ -96,6 +100,9 @@ external verification tools still need to be installed separately.
 
 ## Docker
 
+Make your life easier and use Docker if you want the quickest working setup.
+The image includes KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA.
+
 Build the image from this repository:
 
 ```sh
@@ -111,7 +118,7 @@ docker run --rm --ulimit='stack=-1:-1' kleva:latest --help
 Check the bundled tools:
 
 ```sh
-docker run --rm --ulimit='stack=-1:-1' --entrypoint bash kleva:latest -lc \
+docker run --rm --ulimit='stack=-1:-1' --entrypoint bash kleva:latest -c \
   'klee --version && ktest-tool --help >/dev/null && frama-c -version && kleva --help >/dev/null'
 ```
 
@@ -124,8 +131,6 @@ docker run --rm --ulimit='stack=-1:-1' -v "$PWD:/work" kleva:latest run module.h
   --mode all \
   --base-dir .
 ```
-
-The image includes KLEVA, KLEE, `ktest-tool`, LLVM tools, and Frama-C EVA.
 
 A small Docker smoke module lives in `docker/smoke`. After building the image,
 you can run the full pipeline against it:
