@@ -14,6 +14,7 @@ ENV KLEE_INCLUDE=/home/klee/klee_src/include
 ENV KLEE_CLANG=/tmp/llvm-130-install_O_D_A/bin/clang
 ENV LLVM_LINK=/tmp/llvm-130-install_O_D_A/bin/llvm-link
 ENV PYTHONPATH=/opt/kleva/src
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu
 ENV PATH="/home/klee/klee_build/bin:/tmp/llvm-130-install_O_D_A/bin:${PATH}"
 
 COPY --from=klee_toolchain /home/klee/klee_src /home/klee/klee_src
