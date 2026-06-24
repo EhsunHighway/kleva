@@ -43,6 +43,7 @@ RUN python3 --version \
     && python3 -m pip install --no-cache-dir --break-system-packages pyyaml \
     && rm -f /tmp/get-pip.py \
     && python3 -c "import yaml" \
+    && if [ -e /usr/local/lib/libminisat.so ] && [ ! -e /usr/local/lib/libminisat.so.2 ]; then ln -s /usr/local/lib/libminisat.so /usr/local/lib/libminisat.so.2; fi \
     && ldconfig \
     && frama-c -version \
     && klee --version \
