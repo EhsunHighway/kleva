@@ -38,6 +38,10 @@ five-step pipeline:
 If EVA cannot prove an output value, KLEVA reports it instead of turning it into
 a guessed oracle.
 
+When a function under test needs a callee, callback, or dependency from
+elsewhere, KLEVA can generate spy/stub code for supported scenarios so the
+interaction can still be exercised and checked as part of the generated test.
+
 ## Status and Feedback
 
 KLEVA is still improving. It uses C syntax and abstract syntax tree analysis to
