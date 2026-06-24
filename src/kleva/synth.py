@@ -1295,6 +1295,22 @@ def _cast_field_expr(cast_type: str, expr: str, field: str) -> str:
     return f"(({cast_type} *){expr})->{field}"
 
 
+def _cast_alias_backing_setup(alias: str, cast_type: str, expr: str, params: dict[str, CParam]) -> list[str]:
+    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", expr.strip())
+    if not m:
+        return []
+    param_name, field_name = m.groups()
+    if param_name not in params:
+        return []
+
+    storage = _safe_c_name(f"kleva_{alias}_{field_name}_storage")
+    return [
+        f"{cast_type} {storage};",
+        f"memset(&{storage}, 0, sizeof({storage}));",
+        f"{param_name}->{field_name} = &{storage};",
+    ]
+
+
 def _decoded_field_aliases(body: str) -> dict[str, tuple[str, str, str]]:
     decoded: dict[str, tuple[str, str, str]] = {}
     for m in re.finditer(
@@ -1474,17 +1490,24 @@ def _source_branch_candidates(
         seen_names.add(safe)
         candidates.append(BranchCandidate(safe, setup))
 
+    def rhs_visible_in_harness(rhs: str) -> bool:
+        if "->" not in rhs:
+            return True
+        base = rhs.split("->", 1)[0].strip()
+        return base in params or base in aliases
+
     if "casted-fields" in shaping_features:
         for alias, (cast_type, expr) in aliases.items():
+            backing_setup = _cast_alias_backing_setup(alias, cast_type, expr, params)
             for m in re.finditer(rf"switch\s*\(\s*{re.escape(alias)}->(\w+)\s*\)", body):
                 field = m.group(1)
                 for case in re.findall(r"\bcase\s+([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*:", body[m.end():]):
-                    setup = [f"(({cast_type} *){expr})->{field} = {case};"]
+                    setup = [*backing_setup, f"(({cast_type} *){expr})->{field} = {case};"]
                     if re.search(rf"{re.escape(alias)}->code\s*==\s*0", body):
                         setup.append(f"(({cast_type} *){expr})->code = 0;")
                     setup.extend(checksum_fixups)
                     add_candidate(f"source_case_{case}", setup)
-                setup = [f"(({cast_type} *){expr})->{field} = 255;"]
+                setup = [*backing_setup, f"(({cast_type} *){expr})->{field} = 255;"]
                 setup.extend(checksum_fixups)
                 add_candidate(f"source_default_{field}", setup)
 
@@ -1492,7 +1515,7 @@ def _source_branch_candidates(
                 rf"{re.escape(alias)}->(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
                 body,
             ):
-                setup = [f"{_cast_field_expr(cast_type, expr, field)} = {value};"]
+                setup = [*backing_setup, f"{_cast_field_expr(cast_type, expr, field)} = {value};"]
                 setup.extend(checksum_fixups)
                 add_candidate(f"source_{alias}_{field}_{value}", setup)
 
@@ -1500,10 +1523,10 @@ def _source_branch_candidates(
                 rf"{re.escape(alias)}->(\w+)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
                 body,
             ):
-                setup = [f"{_cast_field_expr(cast_type, expr, field)} = {value};"]
+                setup = [*backing_setup, f"{_cast_field_expr(cast_type, expr, field)} = {value};"]
                 setup.extend(checksum_fixups)
                 add_candidate(f"source_{alias}_{field}_eq_{value}", setup)
-                setup = [f"{_cast_field_expr(cast_type, expr, field)} = {_nonmatching_value(value)};"]
+                setup = [*backing_setup, f"{_cast_field_expr(cast_type, expr, field)} = {_nonmatching_value(value)};"]
                 setup.extend(checksum_fixups)
                 add_candidate(f"source_{alias}_{field}_ne_{value}", setup)
 
@@ -1519,6 +1542,8 @@ def _source_branch_candidates(
                 rf"\b{re.escape(local)}\s*(<|>|<=|>=|==|!=)\s*([A-Za-z_]\w*(?:->\w+)?|0x[0-9a-fA-F]+|\d+)",
                 body,
             ):
+                if not rhs_visible_in_harness(rhs):
+                    continue
                 if op == "<":
                     true_value = f"(({rhs}) > 0 ? ({rhs}) - 1 : 0)"
                     false_value = rhs

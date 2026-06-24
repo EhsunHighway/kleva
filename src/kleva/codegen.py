@@ -121,6 +121,33 @@ def _unit_fn(
 
 # ── file writers ──────────────────────────────────────────────────────────────
 
+def _dedup_preamble_blocks(recipes: list[Recipe]) -> list[str]:
+    seen: set[str] = set()
+    out:  list[str] = []
+
+    for r in recipes:
+        i = 0
+        while i < len(r.preamble):
+            line = r.preamble[i]
+            block = [line]
+            if line.startswith("static ") and line.rstrip().endswith("{"):
+                depth = line.count("{") - line.count("}")
+                i += 1
+                while i < len(r.preamble) and depth > 0:
+                    block.append(r.preamble[i])
+                    depth += r.preamble[i].count("{") - r.preamble[i].count("}")
+                    i += 1
+            else:
+                i += 1
+
+            key = "\n".join(block)
+            if key not in seen:
+                seen.add(key)
+                out.extend(block)
+
+    return out
+
+
 def write_probe_driver(
     recipes: list[Recipe],
     path:    str,
@@ -143,13 +170,7 @@ def write_probe_driver(
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(_PROBE_HEADER.format(ts=ts, header=header))
-        seen_preamble: set[str] = set()
-        preamble_lines: list[str] = []
-        for r in recipes:
-            for line in r.preamble:
-                if line not in seen_preamble:
-                    seen_preamble.add(line)
-                    preamble_lines.append(line)
+        preamble_lines = _dedup_preamble_blocks(recipes)
         if preamble_lines:
             for line in preamble_lines:
                 f.write(line + "\n")
@@ -227,13 +248,7 @@ def write_unit_tests(
     with open(path, "w") as f:
         f.write(_UNIT_HEADER.format(ts=ts, header=header))
         # Emit preamble declarations (static helpers, etc.) deduplicated.
-        seen_preamble: set[str] = set()
-        preamble_lines: list[str] = []
-        for r in recipes:
-            for line in r.preamble:
-                if line not in seen_preamble:
-                    seen_preamble.add(line)
-                    preamble_lines.append(line)
+        preamble_lines = _dedup_preamble_blocks(recipes)
         if preamble_lines:
             for line in preamble_lines:
                 f.write(line + "\n")
