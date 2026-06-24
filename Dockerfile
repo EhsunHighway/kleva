@@ -35,7 +35,7 @@ COPY docker/kleva /usr/local/bin/kleva
 
 RUN python3 --version \
     && apt-get update \
-    && apt-get install -y --no-install-recommends libgoogle-perftools4 libsqlite3-0 \
+    && apt-get install -y --no-install-recommends libgoogle-perftools4 libsqlite3-0 libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py', '/tmp/get-pip.py')" \
     && python3 /tmp/get-pip.py --break-system-packages \
