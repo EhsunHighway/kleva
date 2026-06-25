@@ -29,7 +29,7 @@ from .acsl_contract import (
     extract_valid_params as _extract_valid_params,
     scalar_values_from_assumptions as _scalar_values_from_assumptions,
 )
-from .ast.model import CFunction, CFunctionPointerTypedef, CParam, CTypeCatalog, DerivedLocal
+from .ast.model import CFunction, CParam, CTypeCatalog, DerivedLocal
 from .ast.parser import (
     build_type_catalog,
     function_decl_map as _function_decl_map,
@@ -39,17 +39,26 @@ from .ast.parser import (
     strip_comments as _strip_comments,
 )
 from .ast.source_query import (
-    camel_to_snake as _camel_to_snake,
     function_accepts_null_param as _function_accepts_null_param,
     function_body as _function_body,
     function_definition_body as _function_definition_body,
     function_frees_param as _function_frees_param,
     function_returns_owned_pointer as _function_returns_owned_pointer,
     function_takes_param_ownership as _function_takes_param_ownership,
-    lower_first as _lower_first,
-    visible_function as _visible_function,
 )
 from .config import resolve_klee_clang, resolve_klee_include, resolve_llvm_link
+from .fixtures.construction import (
+    default_return_value as _default_return_value,
+    default_scalar_value as _default_scalar_value,
+    function_pointer_stub_name as _function_pointer_stub_name,
+    function_pointer_stub_preamble as _function_pointer_stub_preamble,
+    is_void_star as _is_void_star,
+    lookup_constructor as _lookup_constructor,
+    lookup_free_fn as _lookup_free_fn,
+    pointer_argument_setup as _pointer_argument_setup,
+    safe_c_name as _safe_c_name,
+    unique_name as _unique_name,
+)
 from .source_discovery import (
     collect_source_include_headers as _collect_source_include_headers,
     collect_visible_headers as _collect_visible_headers,
@@ -143,254 +152,6 @@ def normalize_shaping_features(
     return enabled
 
 
-def _lookup_constructor(
-    base_type: str,
-    function_decls: dict[str, CFunction] | None = None,
-) -> CFunction | None:
-    """
-    Find a visible factory-style constructor for a type.
-
-    This intentionally does not return a guessed fallback. Inventing
-    T_create() for arbitrary domains makes synthesized YAML non-portable.
-    """
-    function_decls = function_decls or {}
-    lower_type = _lower_first(base_type)
-    snake_type = _camel_to_snake(base_type)
-    candidates = [
-        f"{lower_type}_create",
-        f"{snake_type}_create",
-        f"{lower_type}_new",
-        f"{snake_type}_new",
-        f"create_{lower_type}",
-        f"create_{snake_type}",
-    ]
-    for candidate in candidates:
-        decl = function_decls.get(candidate)
-        if decl and decl.return_is_pointer and decl.return_base == base_type:
-            return decl
-    return None
-
-
-def _lookup_free_fn(base_type: str, source_text: str | None = None) -> str | None:
-    """
-    Guess the free/destroy function for a type.
-    Uses naming conventions: T_free(), T_destroy().
-    """
-    lower_type = _lower_first(base_type)
-    snake_type = _camel_to_snake(base_type)
-    candidates = [
-        f"{lower_type}_free",
-        f"{snake_type}_free",
-        f"{lower_type}_destroy",
-        f"{snake_type}_destroy",
-        f"free_{lower_type}",
-        f"free_{snake_type}",
-    ]
-    for candidate in candidates:
-        if _visible_function(candidate, source_text):
-            return candidate
-    return None
-
-
-def _unique_name(preferred: str, used_names: set[str]) -> str:
-    clean = re.sub(r"\W+", "_", preferred).strip("_") or "tmp"
-    if clean not in used_names:
-        used_names.add(clean)
-        return clean
-    i = 2
-    while f"{clean}_{i}" in used_names:
-        i += 1
-    name = f"{clean}_{i}"
-    used_names.add(name)
-    return name
-
-
-def _default_scalar_value(p: CParam) -> str:
-    name = p.name.lower()
-    if "mtu" in name:
-        return "1500"
-    if "prefix" in name:
-        return "24"
-    if "capacity" in name or "cap" in name or "size" in name:
-        return "64"
-    if "max" in name or "count" in name:
-        return "4"
-    if "protocol" in name:
-        return "17"
-    if "ip" in name:
-        return "0x0100A8C0"
-    if p.base_type in ("size_t", "uint64_t", "uint32_t", "uint16_t", "uint8_t"):
-        return "1"
-    if p.base_type in ("int", "int64_t", "int32_t", "int16_t", "int8_t"):
-        return "1"
-    return "0"
-
-
-def _default_return_value(return_type: str) -> str:
-    rt = return_type.strip()
-    if rt == "void":
-        return ""
-    if "*" in rt:
-        return "0"
-    return "0"
-
-
-def _function_pointer_stub_name(alias: str) -> str:
-    return f"kleva_stub_{_safe_c_name(alias)}"
-
-
-def _function_pointer_stub_preamble(decl: CFunctionPointerTypedef) -> list[str]:
-    params: list[str] = []
-    for i, p in enumerate(decl.params):
-        name = p.name or f"arg{i}"
-        raw_type = p.raw_type.strip()
-        if p.is_array:
-            raw_type = re.sub(r"\[[^\]]*\]", f"*{name}", raw_type)
-        elif not re.search(rf"\b{re.escape(name)}\b", raw_type):
-            raw_type = f"{raw_type} {name}"
-        params.append(raw_type)
-
-    params_s = ", ".join(params) if params else "void"
-    lines = [f"static {decl.return_type} {_function_pointer_stub_name(decl.name)}({params_s}) {{"]
-    for p in decl.params:
-        lines.append(f"    (void){p.name};")
-    ret = _default_return_value(decl.return_type)
-    if ret:
-        lines.append(f"    return {ret};")
-    lines.append("}")
-    return lines
-
-
-def _constructor_arg_setup(
-    p: CParam,
-    owner_var: str,
-    source_text: str | None,
-    type_catalog: CTypeCatalog | None,
-    function_decls: dict[str, CFunction] | None,
-    used_names: set[str],
-    depth: int,
-) -> tuple[list[str], str]:
-    if p.is_array:
-        size = p.array_size or 1
-        var_name = _unique_name(f"{owner_var}_{p.name}", used_names)
-        zeros = ", ".join(["0"] * size)
-        return [f"uint8_t {var_name}[{size}] = {{{zeros}}};"], var_name
-
-    if p.is_pointer:
-        if p.base_type == "char":
-            return [], '"kleva"'
-        if p.base_type == "void":
-            return [], "NULL"
-        setup, arg, _cleanup = _pointer_argument_setup(
-            p,
-            source_text=source_text,
-            type_catalog=type_catalog,
-            function_decls=function_decls,
-            owner_func=None,
-            used_names=used_names,
-            preferred_name=f"{owner_var}_{p.name}",
-            depth=depth + 1,
-        )
-        return setup, arg
-
-    return [], _default_scalar_value(p)
-
-
-def _constructor_setup(
-    decl: CFunction,
-    base_type: str,
-    var_name: str,
-    source_text: str | None,
-    type_catalog: CTypeCatalog | None,
-    function_decls: dict[str, CFunction] | None,
-    used_names: set[str],
-    depth: int,
-) -> tuple[list[str], str, list[str]]:
-    if depth > 3:
-        return [], "NULL", []
-
-    lines: list[str] = []
-    args: list[str] = []
-    for p in decl.params:
-        setup, arg = _constructor_arg_setup(
-            p, var_name, source_text, type_catalog, function_decls, used_names, depth
-        )
-        lines.extend(setup)
-        args.append(arg)
-
-    args_str = ", ".join(args)
-    lines.extend([
-        f"{base_type} *{var_name} = {decl.name}({args_str});",
-        f"__GUARD__({var_name})",
-    ])
-
-    cleanup: list[str] = []
-    free_fn = _lookup_free_fn(base_type, source_text)
-    if free_fn:
-        cleanup.append(f"{free_fn}({var_name});")
-    return lines, var_name, cleanup
-
-
-def _pointer_argument_setup(
-    p: CParam,
-    source_text: str | None = None,
-    type_catalog: CTypeCatalog | None = None,
-    function_decls: dict[str, CFunction] | None = None,
-    owner_func: str | None = None,
-    used_names: set[str] | None = None,
-    preferred_name: str | None = None,
-    depth: int = 0,
-) -> tuple[list[str], str, list[str]]:
-    """Generate setup lines, call argument, and cleanup for one pointer param."""
-    used_names = used_names or set()
-    if _is_void_star(p):
-        return [], "NULL", []
-
-    var_name = _unique_name(preferred_name or p.name, used_names)
-    if p.base_type == "uint8_t":
-        buf_name = _unique_name(f"{var_name}_buf", used_names)
-        return (
-            [
-                f"uint8_t {buf_name}[64];",
-                f"memset({buf_name}, 0, sizeof({buf_name}));",
-            ],
-            buf_name,
-            [],
-        )
-
-    constructor = _lookup_constructor(p.base_type, function_decls)
-    if constructor:
-        lines, arg, cleanup = _constructor_setup(
-            constructor,
-            p.base_type,
-            var_name,
-            source_text,
-            type_catalog,
-            function_decls,
-            used_names,
-            depth,
-        )
-        if cleanup and cleanup[0].startswith(f"{owner_func}("):
-            cleanup = []
-        return lines, arg, cleanup
-
-    if type_catalog and type_catalog.is_complete_struct(p.base_type):
-        return (
-            [
-                f"{p.base_type} {var_name};",
-                f"memset(&{var_name}, 0, sizeof({var_name}));",
-            ],
-            f"&{var_name}",
-            [],
-        )
-
-    return (
-        [f"/* kleva synth: no visible allocation strategy for {p.base_type} *{p.name}; using NULL */"],
-        "NULL",
-        [],
-    )
-
-
 def _struct_has_fields(type_catalog: CTypeCatalog | None, type_name: str, fields: set[str]) -> bool:
     if not type_catalog:
         return False
@@ -430,10 +191,6 @@ def _append_len_data_shape(lines: list[str], arg: str) -> None:
         return
     lines.append(f"if ({arg}->len == 0) {arg}->len = 8;")
     lines.append(f"memset({arg}->data, 0, {arg}->len);")
-
-
-def _safe_c_name(text: str) -> str:
-    return re.sub(r"\W+", "_", text).strip("_") or "tmp"
 
 
 def _literal_for_relation(op: str, rhs: str) -> str:
@@ -1863,13 +1620,6 @@ def _source_branch_candidates(
 def _is_assigns_nothing(assigns: str) -> bool:
     """Check if assigns clause is \\nothing."""
     return "nothing" in assigns or "\\nothing" in assigns
-
-
-# ── Body generators ───────────────────────────────────────────────────────────
-
-def _is_void_star(p: CFunction | CParam) -> bool:
-    """Check if a param is `void *`."""
-    return p.base_type == 'void' and p.is_pointer
 
 
 def _param_ref_from_arg(arg: str) -> tuple[str, str] | None:
