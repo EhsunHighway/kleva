@@ -77,6 +77,7 @@ def run_pipeline(
     framac:     str | None = None,
     base_dir:   str = ".",
     verbose:    bool = True,
+    emit_unproved: str = "off",
 ) -> dict:
     """
     Phases 1-5 only (assumes .ktest files already exist from run_klee_phase).
@@ -165,6 +166,7 @@ def run_pipeline(
         unit_path,
         cfg.module_header,
         ts,
+        emit_unproved = emit_unproved,
     )
     log(
         f"  wrote: {unit_path} "
@@ -179,6 +181,9 @@ def run_pipeline(
         "skipped_candidates": skipped_candidates,
         "probe_file": probe_path,
         "unit_file":  unit_path,
+        "emit_unproved": emit_unproved,
+        "unproved_unit_file": str(Path(unit_path).with_name(f"{Path(unit_path).stem}_unproved{Path(unit_path).suffix}")),
+        "unproved_report_file": str(Path(unit_path).with_name(f"{Path(unit_path).stem}_unproved_report.md")),
     }
 
 

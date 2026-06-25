@@ -38,6 +38,15 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--quiet", "-q", action="store_true")
 
 
+def _add_emit_unproved_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--emit-unproved",
+        choices=("off", "report", "tests", "all"),
+        default="off",
+        help="emit EVA-unproved candidate diagnostics separately instead of only skipping them",
+    )
+
+
 def _add_synth_input_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("header", help="path to the .h file")
     p.add_argument("--source",  "-s", default=None,
@@ -87,6 +96,7 @@ def main() -> None:
     p_gen.add_argument("--framac",     default=None, help="override frama-c path")
     p_gen.add_argument("--eva-timeout", type=int, default=None,
                        help="seconds per EVA probe (0 = unlimited)")
+    _add_emit_unproved_arg(p_gen)
 
     # ── kleva all ──────────────────────────────────────────────────────────────
     p_all = sub.add_parser(
@@ -99,6 +109,7 @@ def main() -> None:
     p_all.add_argument("--framac",     default=None, help="override frama-c path")
     p_all.add_argument("--eva-timeout", type=int, default=None,
                        help="seconds per EVA probe (0 = unlimited)")
+    _add_emit_unproved_arg(p_all)
 
     # ── kleva synth ────────────────────────────────────────────────────────────
     p_synth = sub.add_parser(
@@ -129,6 +140,7 @@ def main() -> None:
     p_run.add_argument("--framac",     default=None, help="override frama-c path")
     p_run.add_argument("--eva-timeout", type=int, default=None,
                        help="seconds per EVA probe (0 = unlimited)")
+    _add_emit_unproved_arg(p_run)
     p_run.add_argument("--quiet", "-q", action="store_true")
 
     # ── kleva augment ─────────────────────────────────────────────────────────
@@ -211,6 +223,7 @@ def main() -> None:
                     framac     = getattr(args, "framac",     None),
                     base_dir   = args.base_dir,
                     verbose    = verbose,
+                    emit_unproved = args.emit_unproved,
                 )
             except ValueError as e:
                 print(f"ERROR: {e}", file=sys.stderr)
@@ -248,6 +261,7 @@ def main() -> None:
                 framac     = getattr(args, "framac",     None),
                 base_dir   = args.base_dir,
                 verbose    = verbose,
+                emit_unproved = args.emit_unproved,
             )
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -263,6 +277,7 @@ def main() -> None:
                 framac     = getattr(args, "framac",     None),
                 base_dir   = args.base_dir,
                 verbose    = verbose,
+                emit_unproved = args.emit_unproved,
             )
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -278,7 +293,7 @@ def main() -> None:
 
 
 def _print_result(result: dict) -> None:
-    print(
+    text = (
         f"\nkleva done: {result['recipes']} test vectors  |  "
         f"{result['proven']} EVA-proven assertions  |  "
         f"{result['unproven']} unproven  |  "
@@ -286,6 +301,12 @@ def _print_result(result: dict) -> None:
         f"  probe → {result['probe_file']}\n"
         f"  tests → {result['unit_file']}"
     )
+    mode = result.get("emit_unproved", "off")
+    if mode in {"tests", "all"}:
+        text += f"\n  unproved tests → {result['unproved_unit_file']}"
+    if mode in {"report", "all"}:
+        text += f"\n  unproved report → {result['unproved_report_file']}"
+    print(text)
 
 
 if __name__ == "__main__":
