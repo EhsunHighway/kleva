@@ -24,6 +24,7 @@ def run_eva(
     src_file:      str,
     src_inc:       str,
     precision:     int = 7,
+    max_time:      int = 120,
     extra_flags:   list[str] | None = None,
     extra_sources: list[str] | None = None,
     extra_includes: list[str] | None = None,
@@ -46,7 +47,8 @@ def run_eva(
     if extra_sources:
         cmd.extend(extra_sources)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    timeout = None if max_time <= 0 else max_time
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return result.stdout + result.stderr
 
 

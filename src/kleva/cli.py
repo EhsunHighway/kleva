@@ -85,6 +85,8 @@ def main() -> None:
     _add_common_args(p_gen)
     p_gen.add_argument("--ktest-tool", default=None, help="override ktest-tool path")
     p_gen.add_argument("--framac",     default=None, help="override frama-c path")
+    p_gen.add_argument("--eva-timeout", type=int, default=None,
+                       help="seconds per EVA probe (0 = unlimited)")
 
     # ── kleva all ──────────────────────────────────────────────────────────────
     p_all = sub.add_parser(
@@ -95,6 +97,8 @@ def main() -> None:
     _add_common_args(p_all)
     p_all.add_argument("--ktest-tool", default=None, help="override ktest-tool path")
     p_all.add_argument("--framac",     default=None, help="override frama-c path")
+    p_all.add_argument("--eva-timeout", type=int, default=None,
+                       help="seconds per EVA probe (0 = unlimited)")
 
     # ── kleva synth ────────────────────────────────────────────────────────────
     p_synth = sub.add_parser(
@@ -123,6 +127,8 @@ def main() -> None:
                        help="optional augment rules applied in memory before running")
     p_run.add_argument("--ktest-tool", default=None, help="override ktest-tool path")
     p_run.add_argument("--framac",     default=None, help="override frama-c path")
+    p_run.add_argument("--eva-timeout", type=int, default=None,
+                       help="seconds per EVA probe (0 = unlimited)")
     p_run.add_argument("--quiet", "-q", action="store_true")
 
     # ── kleva augment ─────────────────────────────────────────────────────────
@@ -191,6 +197,8 @@ def main() -> None:
 
         cfg     = load_config_text(yaml_text)
         verbose = not args.quiet
+        if args.eva_timeout is not None:
+            cfg.eva_max_time = args.eva_timeout
 
         if args.mode in ("all", "klee"):
             run_klee_phase(cfg, base_dir=args.base_dir, verbose=verbose)
@@ -226,6 +234,8 @@ def main() -> None:
 
     cfg     = load_config(config_path)
     verbose = not args.quiet
+    if getattr(args, "eva_timeout", None) is not None:
+        cfg.eva_max_time = args.eva_timeout
 
     if args.cmd == "klee":
         run_klee_phase(cfg, base_dir=args.base_dir, verbose=verbose)

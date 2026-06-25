@@ -16,6 +16,7 @@ Why pure functions first?
 from __future__ import annotations
 
 import sys
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -122,21 +123,29 @@ def run_pipeline(
     probe_dir.mkdir(parents=True, exist_ok=True)
 
     probe_singletons: dict[str, dict[str, int]] = {}
-    for r in all_recipes:
+    timed_out: list[str] = []
+    for idx, r in enumerate(all_recipes, start=1):
         standalone_path = str(probe_dir / f"probe_{r.fn_id}.c")
         write_probe_standalone(r, standalone_path, cfg.module_header, ts)
         fn = "probe_" + r.fn_id
-        eva_log = run_eva(
-            framac,
-            standalone_path,
-            src_path,
-            inc_path,
-            precision       = cfg.eva_precision,
-            extra_flags     = cfg.eva_extra_flags,
-            extra_sources   = [_resolve(base_dir, s) for s in cfg.extra_sources]
-                             + [_resolve(base_dir, s) for s in cfg.eva_extra_sources],
-            extra_includes  = [_resolve(base_dir, d) for d in cfg.extra_includes],
-        )
+        log(f"  EVA {idx}/{len(all_recipes)}: {r.fn_id}")
+        try:
+            eva_log = run_eva(
+                framac,
+                standalone_path,
+                src_path,
+                inc_path,
+                precision       = cfg.eva_precision,
+                max_time        = cfg.eva_max_time,
+                extra_flags     = cfg.eva_extra_flags,
+                extra_sources   = [_resolve(base_dir, s) for s in cfg.extra_sources]
+                                 + [_resolve(base_dir, s) for s in cfg.eva_extra_sources],
+                extra_includes  = [_resolve(base_dir, d) for d in cfg.extra_includes],
+            )
+        except subprocess.TimeoutExpired:
+            timed_out.append(r.fn_id)
+            log(f"    timeout after {cfg.eva_max_time}s")
+            continue
         fn_singletons = parse_singletons(eva_log).get(fn, {})
         if fn_singletons:
             probe_singletons[fn] = fn_singletons
@@ -144,6 +153,8 @@ def run_pipeline(
     # ── Phase 4: parse EVA singletons ─────────────────────────────────────────
     log("=== Phase 4: parsing EVA singletons ===")
     log(f"  probe functions with singletons: {len(probe_singletons)}")
+    if timed_out:
+        log(f"  EVA timeouts: {len(timed_out)}")
 
     # ── Phase 5: write unit tests ──────────────────────────────────────────────
     log("=== Phase 5: generating unit tests ===")

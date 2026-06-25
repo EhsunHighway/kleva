@@ -15,6 +15,7 @@ YAML schema:
 
     eva:
       precision:   7
+      max_time:    120
       extra_flags:
         - -eva-no-alloc-returns-null
 
@@ -197,6 +198,7 @@ class ModuleConfig:
     ktest_tool:         str = "ktest-tool"
     framac:             str = "frama-c"
     eva_precision:      int = 7
+    eva_max_time:       int = 120
     eva_extra_flags:    list[str] = field(default_factory=list)
     eva_extra_sources:  list[str] = field(default_factory=list)  # EVA-only extra .c files (e.g. libc/string.c)
     probe_file:       str = "eva/probe.c"
@@ -222,6 +224,7 @@ def _config_from_data(data: dict[str, Any]) -> ModuleConfig:
         ktest_tool      = tools.get("ktest_tool", "ktest-tool"),
         framac          = tools.get("framac",     "frama-c"),
         eva_precision   = eva.get("precision",    7),
+        eva_max_time    = eva.get("max_time",     120),
         eva_extra_flags   = eva.get("extra_flags",   []),
         eva_extra_sources = eva.get("extra_sources", []),
         probe_file      = out.get("probe_file",   "eva/probe.c"),
