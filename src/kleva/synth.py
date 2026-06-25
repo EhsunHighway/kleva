@@ -77,11 +77,7 @@ from .source_discovery import (
     source_include_names as _source_include_names,
     suggest_extra_sources as _suggest_extra_sources,
 )
-from .shaping.byte_order import (
-    decoded_field_aliases as _byte_order_decoded_field_aliases,
-    host_to_network_fn as _byte_order_host_to_network_fn,
-    propagate_local_aliases as _byte_order_propagate_local_aliases,
-)
+from .shaping.byte_order import host_to_network_fn as _byte_order_host_to_network_fn
 from .shaping.branches import (
     BranchShapeOps,
     source_branch_candidates as _branch_shaper_source_branch_candidates,
@@ -119,6 +115,23 @@ from .shaping.lookups import (
     infer_lookup_shape_for_call as _lookup_shaper_infer_lookup_shape_for_call,
     lookup_condition_setup as _lookup_shaper_condition_setup,
     lookup_miss_setup as _lookup_shaper_miss_setup,
+)
+from .shaping.source_aliases import (
+    cast_alias_backing_setup as _source_aliases_cast_alias_backing_setup,
+    cast_aliases as _source_aliases_cast_aliases,
+    cast_field_expr as _source_aliases_cast_field_expr,
+    checksum_recompute_lines as _source_aliases_checksum_recompute_lines,
+    decoded_field_aliases as _source_aliases_decoded_field_aliases,
+    derived_local_aliases as _source_aliases_derived_local_aliases,
+    direct_field_aliases as _source_aliases_direct_field_aliases,
+    expand_alias_expr as _source_aliases_expand_alias_expr,
+    field_expr_from_ref as _source_aliases_field_expr_from_ref,
+    good_path_setup_from_source as _source_aliases_good_path_setup_from_source,
+    literal_or_macro_value as _source_aliases_literal_or_macro_value,
+    propagate_local_aliases as _source_aliases_propagate_local_aliases,
+    setup_local_bitwise_or as _source_aliases_setup_local_bitwise_or,
+    setup_local_value as _source_aliases_setup_local_value,
+    void_param_cast_types as _source_aliases_void_param_cast_types,
 )
 from .shaping.switches import (
     StateSwitchOps,
@@ -280,32 +293,11 @@ def _source_for_branch_shaping(source_text: str | None, func_name: str) -> str:
 
 
 def _cast_aliases(body: str, params: dict[str, CParam]) -> dict[str, tuple[str, str]]:
-    aliases: dict[str, tuple[str, str]] = {}
-    for m in re.finditer(
-        r"\b([A-Za-z_]\w*)\s*\*\s*(\w+)\s*=\s*\(\s*\1\s*\*\s*\)\s*([^;]+);",
-        body,
-    ):
-        cast_type, alias, expr = m.groups()
-        if any(re.search(rf"\b{re.escape(p)}\b", expr) for p in params):
-            aliases[alias] = (cast_type, expr.strip())
-    return aliases
+    return _source_aliases_cast_aliases(body, params)
 
 
 def _void_param_cast_types(body: str, func: CFunction) -> dict[str, str]:
-    """Find source patterns like `Type *alias = (Type *)ctx;` for void * params."""
-    void_params = {p.name for p in func.params if _is_void_star(p)}
-    if not void_params:
-        return {}
-
-    casts: dict[str, str] = {}
-    for cast_type, _alias, expr in re.findall(
-        r"\b([A-Za-z_]\w*)\s*\*\s*(\w+)\s*=\s*\(\s*\1\s*\*\s*\)\s*([^;]+);",
-        body,
-    ):
-        expr = expr.strip()
-        if expr in void_params:
-            casts.setdefault(expr, cast_type)
-    return casts
+    return _source_aliases_void_param_cast_types(body, func, _is_void_star)
 
 
 def _rewrite_setup_with_param_args(setup: list[str], param_args: dict[str, str]) -> list[str]:
@@ -325,112 +317,43 @@ def _rewrite_setup_with_param_args(setup: list[str], param_args: dict[str, str])
 
 
 def _checksum_recompute_lines(body: str, aliases: dict[str, tuple[str, str]]) -> list[str]:
-    lines: list[str] = []
-    seen: set[str] = set()
-    for m in re.finditer(r"\b(\w*checksum\w*)\s*\(\s*(\w+)->data\s*,\s*\2->len\s*\)\s*!=\s*0", body):
-        fn, obj = m.groups()
-        for cast_type, expr in aliases.values():
-            if expr == f"{obj}->data":
-                _append_unique(lines, f"(({cast_type} *){obj}->data)->checksum = 0;", seen)
-                _append_unique(lines, f"(({cast_type} *){obj}->data)->checksum = {fn}({obj}->data, {obj}->len);", seen)
-    return lines
+    return _source_aliases_checksum_recompute_lines(body, aliases, _append_unique)
 
 
 def _cast_field_expr(cast_type: str, expr: str, field: str) -> str:
-    return f"(({cast_type} *){expr})->{field}"
+    return _source_aliases_cast_field_expr(cast_type, expr, field)
 
 
 def _expand_alias_expr(expr: str, aliases: dict[str, tuple[str, str]]) -> str:
-    expanded = expr.strip()
-    for alias, (cast_type, cast_expr) in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        expanded = re.sub(
-            rf"\b{re.escape(alias)}\b",
-            f"(({cast_type} *){cast_expr})",
-            expanded,
-        )
-    return expanded
+    return _source_aliases_expand_alias_expr(expr, aliases)
 
 
 def _cast_alias_backing_setup(alias: str, cast_type: str, expr: str, params: dict[str, CParam]) -> list[str]:
-    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", expr.strip())
-    if not m:
-        return []
-    param_name, field_name = m.groups()
-    if param_name not in params:
-        return []
-
-    storage = _safe_c_name(f"kleva_{alias}_{field_name}_storage")
-    return [
-        f"{cast_type} {storage};",
-        f"memset(&{storage}, 0, sizeof({storage}));",
-        f"{param_name}->{field_name} = &{storage};",
-    ]
+    return _source_aliases_cast_alias_backing_setup(alias, cast_type, expr, params, _safe_c_name)
 
 
 def _propagate_local_aliases(body: str, aliases: dict) -> dict:
-    return _byte_order_propagate_local_aliases(body, aliases)
+    return _source_aliases_propagate_local_aliases(body, aliases)
 
 
 def _decoded_field_aliases(body: str) -> dict[str, tuple[str, str, str]]:
-    return _byte_order_decoded_field_aliases(body)
+    return _source_aliases_decoded_field_aliases(body)
 
 
 def _direct_field_aliases(body: str) -> dict[str, tuple[str, str]]:
-    direct: dict[str, tuple[str, str]] = {}
-    for m in re.finditer(
-        r"\b(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)\s+(\w+)\s*=\s*(\w+)->(\w+)\s*;",
-        body,
-    ):
-        local, alias, field = m.groups()
-        direct[local] = (alias, field)
-    return _propagate_local_aliases(body, direct)
+    return _source_aliases_direct_field_aliases(body)
 
 
 def _derived_local_aliases(body: str) -> dict[str, DerivedLocal]:
-    derived: dict[str, DerivedLocal] = {}
-    scalar = r"(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)"
-
-    for m in re.finditer(
-        rf"\b{scalar}\s+(\w+)\s*=\s*(\w+)\s*>>\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*;",
-        body,
-    ):
-        local, base, shift = m.groups()
-        derived[local] = DerivedLocal("shr", base, shift)
-
-    for m in re.finditer(
-        rf"\b{scalar}\s+(\w+)\s*=\s*(\w+)\s*&\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*;",
-        body,
-    ):
-        local, base, mask = m.groups()
-        derived[local] = DerivedLocal("and", base, mask)
-
-    for m in re.finditer(
-        rf"\b{scalar}\s+(\w+)\s*=\s*(\w+)->(\w+)\s*-\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*;",
-        body,
-    ):
-        local, obj, field, rhs = m.groups()
-        derived[local] = DerivedLocal("field_sub", f"{obj}->{field}", rhs)
-
-    changed = True
-    while changed:
-        changed = False
-        for m in re.finditer(r"\b(\w+)\s*=\s*(\w+)\s*;", body):
-            dst, src = m.groups()
-            if src in derived and dst not in derived:
-                derived[dst] = derived[src]
-                changed = True
-    return derived
+    return _source_aliases_derived_local_aliases(body)
 
 
 def _literal_or_macro_value(value: str) -> bool:
-    return bool(re.fullmatch(r"0x[0-9a-fA-F]+|\d+", value)) or value.upper() == value
+    return _source_aliases_literal_or_macro_value(value)
 
 
 def _field_expr_from_ref(ref: str) -> str | None:
-    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", ref.strip())
-    if m:
-        return f"{m.group(1)}->{m.group(2)}"
-    return None
+    return _source_aliases_field_expr_from_ref(ref)
 
 
 def _setup_local_bitwise_or(
@@ -441,29 +364,14 @@ def _setup_local_bitwise_or(
     direct_aliases: dict[str, tuple[str, str]],
     derived_aliases: dict[str, DerivedLocal] | None,
 ) -> list[str]:
-    derived = (derived_aliases or {}).get(local)
-    if derived and derived.kind == "and":
-        base = derived.base
-        decoded = decoded_aliases.get(base)
-        if decoded:
-            decode_fn, alias, field = decoded
-            if alias in aliases:
-                encode_fn = _host_to_network_fn(decode_fn)
-                if encode_fn:
-                    cast_type, expr = aliases[alias]
-                    target = _cast_field_expr(cast_type, expr, field)
-                    return [f"{target} = {encode_fn}({decode_fn}({target}) | ({value}));"]
-
-        direct = direct_aliases.get(base)
-        if direct and direct[0] in aliases:
-            alias, field = direct
-            cast_type, expr = aliases[alias]
-            target = _cast_field_expr(cast_type, expr, field)
-            return [f"{target} |= ({value});"]
-
-        return _setup_local_value(base, value, aliases, decoded_aliases, direct_aliases, derived_aliases)
-
-    return _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, None)
+    return _source_aliases_setup_local_bitwise_or(
+        local,
+        value,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+    )
 
 
 def _setup_local_value(
@@ -474,41 +382,14 @@ def _setup_local_value(
     direct_aliases: dict[str, tuple[str, str]],
     derived_aliases: dict[str, DerivedLocal] | None = None,
 ) -> list[str]:
-    derived = (derived_aliases or {}).get(local)
-    if derived:
-        if derived.kind == "shr":
-            return _setup_local_value(
-                derived.base,
-                f"(({value}) << {derived.arg})",
-                aliases,
-                decoded_aliases,
-                direct_aliases,
-                derived_aliases,
-            )
-        if derived.kind == "and":
-            return _setup_local_bitwise_or(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases)
-        if derived.kind == "field_sub":
-            target = _field_expr_from_ref(derived.base)
-            if target:
-                return [f"{target} = ({value}) + {derived.arg};"]
-
-    decoded = decoded_aliases.get(local)
-    if decoded:
-        decode_fn, alias, field = decoded
-        if alias in aliases:
-            encode_fn = _host_to_network_fn(decode_fn)
-            if encode_fn:
-                cast_type, expr = aliases[alias]
-                return [f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({value});"]
-
-    direct = direct_aliases.get(local)
-    if direct:
-        alias, field = direct
-        if alias in aliases:
-            cast_type, expr = aliases[alias]
-            return [f"{_cast_field_expr(cast_type, expr, field)} = {value};"]
-
-    return []
+    return _source_aliases_setup_local_value(
+        local,
+        value,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+    )
 
 
 def _good_path_setup_from_source(
@@ -518,55 +399,14 @@ def _good_path_setup_from_source(
     direct_aliases: dict[str, tuple[str, str]],
     derived_aliases: dict[str, DerivedLocal] | None = None,
 ) -> list[str]:
-    lines: list[str] = []
-    seen: set[str] = set()
-
-    for alias, (cast_type, expr) in aliases.items():
-        for field, value in re.findall(
-            rf"{re.escape(alias)}->(\w+)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
-            body,
-        ):
-            _append_unique(lines, f"{_cast_field_expr(cast_type, expr, field)} = {value};", seen)
-
-    for local, (decode_fn, alias, field) in decoded_aliases.items():
-        if alias not in aliases:
-            continue
-        encode_fn = _host_to_network_fn(decode_fn)
-        if not encode_fn:
-            continue
-        cast_type, expr = aliases[alias]
-        for op, rhs in re.findall(
-            rf"\b{re.escape(local)}\s*(<|>)\s*([A-Za-z_]\w*(?:->\w+)?|0x[0-9a-fA-F]+|\d+)",
-            body,
-        ):
-            if not _literal_or_macro_value(rhs):
-                continue
-            false_value = rhs
-            _append_unique(lines, f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({false_value});", seen)
-
-    for local in [*decoded_aliases.keys(), *direct_aliases.keys()]:
-        for op, rhs in re.findall(
-            rf"\b{re.escape(local)}\s*(!=|==)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
-            body,
-        ):
-            if not _literal_or_macro_value(rhs):
-                continue
-            value = rhs if op == "!=" else rhs
-            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
-                _append_unique(lines, line, seen)
-
-    for local in derived_aliases or {}:
-        for op, rhs in re.findall(
-            rf"\b{re.escape(local)}\s*(!=|==)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
-            body,
-        ):
-            if not _literal_or_macro_value(rhs):
-                continue
-            value = rhs
-            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
-                _append_unique(lines, line, seen)
-
-    return lines
+    return _source_aliases_good_path_setup_from_source(
+        body,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        _append_unique,
+    )
 
 
 def _loop_table_candidates(
