@@ -17,13 +17,35 @@ from __future__ import annotations
 
 import re
 import sys
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from .acsl import ACSLSpec, ACSLBehavior
+from .acsl_contract import (
+    extract_non_null_params as _extract_non_null_params,
+    extract_nonzero_params as _extract_nonzero_params,
+    extract_null_params as _extract_null_params,
+    extract_result_value as _extract_result_value,
+    extract_valid_params as _extract_valid_params,
+    scalar_values_from_assumptions as _scalar_values_from_assumptions,
+)
 from .ast.model import CFunction, CFunctionPointerTypedef, CParam, CTypeCatalog, DerivedLocal
+from .ast.parser import (
+    build_type_catalog,
+    function_decl_map as _function_decl_map,
+    parse_header,
+    parse_param as _parse_param,
+    split_call_args as _split_call_args,
+    strip_comments as _strip_comments,
+)
 from .config import resolve_klee_clang, resolve_klee_include, resolve_llvm_link
+from .source_discovery import (
+    collect_source_include_headers as _collect_source_include_headers,
+    collect_visible_headers as _collect_visible_headers,
+    dedupe_paths as _dedupe_paths,
+    source_include_names as _source_include_names,
+    suggest_extra_sources as _suggest_extra_sources,
+)
 from .shaping.byte_order import (
     decoded_field_aliases as _byte_order_decoded_field_aliases,
     host_to_network_fn as _byte_order_host_to_network_fn,
@@ -110,168 +132,6 @@ def normalize_shaping_features(
     return enabled
 
 
-# ── C header parser (moved from init.py) ──────────────────────────────────────
-
-def _strip_comments(text: str) -> str:
-    """Remove ACSL annotations and C comments."""
-    text = re.sub(r"/\*@.*?\*/", "", text, flags=re.DOTALL)  # ACSL
-    text = re.sub(r"/\*.*?\*/",  "", text, flags=re.DOTALL)  # block comments
-    text = re.sub(r"//[^\n]*",   "", text)                    # line comments
-    return text
-
-
-def _parse_param(raw: str, index: int = 0) -> CParam | None:
-    raw = raw.strip()
-    if not raw or raw in ("void", "..."):
-        return None
-
-    is_const   = bool(re.search(r'\bconst\b', raw))
-    is_pointer = "*" in raw
-    is_array   = bool(re.search(r'\[\d*\]', raw))
-    array_size = 0
-    if is_array:
-        m = re.search(r'\[(\d+)\]', raw)
-        array_size = int(m.group(1)) if m else 0
-
-    # Normalise: remove qualifiers and decorators to get tokens
-    clean = re.sub(r'\bconst\b|\bvolatile\b|\brestrict\b', '', raw)
-    clean = re.sub(r'\[[^\]]*\]', ' ', clean)
-    clean = clean.replace('*', ' ')
-    tokens = clean.split()
-
-    if not tokens:
-        return None
-
-    type_words = {
-        "void", "char", "int", "float", "double", "size_t", "ssize_t",
-        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-        "int8_t", "int16_t", "int32_t", "int64_t",
-        "unsigned", "signed", "long", "short", "struct",
-    }
-
-    # Parameter names are optional in C declarations.
-    if len(tokens) == 1 or tokens[-1] in type_words:
-        name = f"arg{index}"
-        type_toks = tokens
-    else:
-        name = tokens[-1]
-        type_toks = tokens[:-1]
-
-    # base_type: skip qualifiers and 'struct', pick first real type token
-    base_type = next(
-        (t for t in type_toks if t not in ("unsigned", "signed", "long", "short", "struct")),
-        type_toks[0] if type_toks else "int",
-    )
-
-    return CParam(
-        name=name,
-        raw_type=raw.strip(),
-        base_type=base_type,
-        is_pointer=is_pointer,
-        is_const=is_const,
-        is_array=is_array,
-        array_size=array_size,
-    )
-
-
-def parse_header(header_path: Path) -> list[CFunction]:
-    """Extract public function declarations from a C header file."""
-    return _parse_function_decls(header_path.read_text())
-
-
-def _parse_function_decls(raw_text: str) -> list[CFunction]:
-    """Extract function declarations from C text."""
-    text = _strip_comments(raw_text)
-    text = re.sub(r"__attribute__\s*\(\([^)]*\)\)", "", text)
-
-    # Remove preprocessor, typedef structs, struct forward decls
-    text = re.sub(r"#[^\n]*",                                          "", text)
-    text = re.sub(r"typedef\s+struct\s*\w*\s*\{[^}]*\}\s*\w+\s*;",   "", text, flags=re.DOTALL)
-    text = re.sub(r"typedef\s+[^;]+;",                                 "", text, flags=re.DOTALL)
-    text = re.sub(r"struct\s+\w+\s*;",                                 "", text)
-    text = re.sub(r"\s+",                                              " ", text)
-
-    funcs: list[CFunction] = []
-
-    # Match:  <return_type>  <name>  ( <params> )  ;
-    pattern = re.compile(
-        r"((?:const\s+)?(?:struct\s+)?\w+(?:\s*\*+)?)"  # return type: one word + optional *
-        r"\s*"                                            # optional space
-        r"(\w+)\s*"                                       # function name
-        r"\(([^)]*)\)\s*;"                                # ( params ) ;
-    )
-
-    for m in pattern.finditer(text):
-        ret_raw  = m.group(1).strip()
-        fname    = m.group(2).strip()
-        args_raw = m.group(3).strip()
-
-        # Skip obvious non-function matches
-        if fname.upper() == fname or fname.startswith("_"):
-            continue
-
-        params: list[CParam] = []
-        if args_raw and args_raw != "void":
-            for i, p_raw in enumerate(args_raw.split(",")):
-                p = _parse_param(p_raw, i)
-                if p:
-                    params.append(p)
-
-        ret_is_ptr  = "*" in ret_raw
-        ret_clean   = re.sub(r"[\*\s]", "", ret_raw.replace("const", "").replace("struct", "")).strip()
-
-        funcs.append(CFunction(
-            name=fname,
-            return_type=ret_raw,
-            return_base=ret_clean,
-            return_is_pointer=ret_is_ptr,
-            params=params,
-        ))
-
-    return funcs
-
-
-def _function_decl_map(text: str) -> dict[str, CFunction]:
-    decls = {f.name: f for f in _parse_function_decls(text)}
-    decls.update(_parse_function_definitions(text))
-    return decls
-
-
-def _parse_function_definitions(raw_text: str) -> dict[str, CFunction]:
-    text = _strip_comments(raw_text)
-    text = re.sub(r"__attribute__\s*\(\([^)]*\)\)", "", text)
-    pattern = re.compile(
-        r"\b(?:static\s+)?(?:inline\s+)?"
-        r"((?:const\s+)?(?:struct\s+)?\w+(?:\s*\*+)?)"
-        r"\s*(\w+)\s*\(([^)]*)\)\s*\{",
-        flags=re.DOTALL,
-    )
-
-    funcs: dict[str, CFunction] = {}
-    for m in pattern.finditer(text):
-        ret_raw, fname, args_raw = m.groups()
-        if fname in {"if", "for", "while", "switch"}:
-            continue
-        params: list[CParam] = []
-        args_raw = args_raw.strip()
-        if args_raw and args_raw != "void":
-            for i, p_raw in enumerate(_split_call_args(args_raw)):
-                p = _parse_param(p_raw, i)
-                if p:
-                    params.append(p)
-
-        ret_is_ptr = "*" in ret_raw
-        ret_clean = re.sub(r"[\*\s]", "", ret_raw.replace("const", "").replace("struct", "")).strip()
-        funcs[fname] = CFunction(
-            name=fname,
-            return_type=ret_raw.strip(),
-            return_base=ret_clean,
-            return_is_pointer=ret_is_ptr,
-            params=params,
-        )
-    return funcs
-
-
 # ── Constructor / free pattern inference ──────────────────────────────────────
 
 def _lower_first(s: str) -> str:
@@ -283,98 +143,6 @@ def _camel_to_snake(s: str) -> str:
     s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", s)
     s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
     return s.lower()
-
-
-def build_type_catalog(text: str) -> CTypeCatalog:
-    """
-    Infer complete-vs-opaque struct types from visible C declarations.
-
-    Complete structs can be stack allocated. Opaque structs must be handled
-    through visible constructors or passed as NULL.
-    """
-    catalog = CTypeCatalog()
-    text = re.sub(r"__attribute__\s*\(\([^)]*\)\)", "", text)
-    field_text = _strip_comments(text)
-
-    for m in re.finditer(
-        r"\btypedef\s+struct\s+(\w+)?\s*\{[^}]*\}\s*(\w+)\s*;",
-        text,
-        flags=re.DOTALL,
-    ):
-        tag, alias = m.group(1), m.group(2)
-        if tag:
-            catalog.complete_structs.add(tag)
-        catalog.complete_structs.add(alias)
-
-    for m in re.finditer(
-        r"\btypedef\s+struct\s+(\w+)?\s*\{(?P<body>[^}]*)\}\s*(?P<alias>\w+)\s*;",
-        field_text,
-        flags=re.DOTALL,
-    ):
-        tag = m.group(1)
-        alias = m.group("alias")
-        fields: dict[str, CParam] = {}
-        for i, field_raw in enumerate(m.group("body").split(";")):
-            field_raw = field_raw.strip()
-            if not field_raw:
-                continue
-            p = _parse_param(field_raw, i)
-            if p:
-                fields[p.name] = p
-        catalog.struct_fields[alias] = fields
-        if tag:
-            catalog.struct_fields[tag] = fields
-
-    for m in re.finditer(
-        r"\bstruct\s+(\w+)\s*\{[^}]*\}\s*;",
-        text,
-        flags=re.DOTALL,
-    ):
-        catalog.complete_structs.add(m.group(1))
-
-    for m in re.finditer(
-        r"\bstruct\s+(?P<tag>\w+)\s*\{(?P<body>[^}]*)\}\s*;",
-        field_text,
-        flags=re.DOTALL,
-    ):
-        fields: dict[str, CParam] = {}
-        for i, field_raw in enumerate(m.group("body").split(";")):
-            field_raw = field_raw.strip()
-            if not field_raw:
-                continue
-            p = _parse_param(field_raw, i)
-            if p:
-                fields[p.name] = p
-        catalog.struct_fields[m.group("tag")] = fields
-
-    for m in re.finditer(r"\btypedef\s+struct\s+(\w+)\s+(\w+)\s*;", text):
-        tag, alias = m.group(1), m.group(2)
-        catalog.opaque_structs.update({tag, alias})
-
-    for m in re.finditer(r"\bstruct\s+(\w+)\s*;", text):
-        catalog.opaque_structs.add(m.group(1))
-
-    for m in re.finditer(
-        r"\btypedef\s+([^;()]+?)\s*\(\s*\*\s*(\w+)\s*\)\s*\(([^;]*)\)\s*;",
-        text,
-        flags=re.DOTALL,
-    ):
-        return_type, name, params_raw = m.groups()
-        params: list[CParam] = []
-        params_raw = params_raw.strip()
-        if params_raw and params_raw != "void":
-            for i, raw_param in enumerate(params_raw.split(",")):
-                p = _parse_param(raw_param, i)
-                if p:
-                    params.append(p)
-        catalog.function_pointers[name] = CFunctionPointerTypedef(
-            name=name,
-            return_type=" ".join(return_type.split()),
-            params=params,
-        )
-
-    catalog.opaque_structs.difference_update(catalog.complete_structs)
-    return catalog
 
 
 def _visible_function(name: str, source_text: str | None) -> bool:
@@ -695,154 +463,6 @@ def _constructor_setup(
     return lines, var_name, cleanup
 
 
-def _collect_visible_headers(
-    header_path: Path,
-    include_dirs: list[Path] | None = None,
-    seen: set[Path] | None = None,
-) -> list[str]:
-    """Read a header and recursively read local quoted includes."""
-    include_dirs = include_dirs or []
-    seen = seen or set()
-
-    try:
-        resolved = header_path.resolve()
-    except FileNotFoundError:
-        return []
-
-    if resolved in seen or not resolved.exists():
-        return []
-    seen.add(resolved)
-
-    text = resolved.read_text()
-    parts = [text]
-    for m in re.finditer(r'^\s*#\s*include\s+"([^"]+)"', text, flags=re.MULTILINE):
-        include_name = m.group(1)
-        candidates = [resolved.parent / include_name]
-        candidates.extend(include_dir / include_name for include_dir in include_dirs)
-        for candidate in candidates:
-            if candidate.exists():
-                parts.extend(_collect_visible_headers(candidate, include_dirs, seen))
-                break
-    return parts
-
-
-def _collect_visible_header_paths(
-    header_path: Path,
-    include_dirs: list[Path] | None = None,
-    seen: set[Path] | None = None,
-) -> list[Path]:
-    """Return a header and recursively discovered local quoted includes."""
-    include_dirs = include_dirs or []
-    seen = seen or set()
-
-    try:
-        resolved = header_path.resolve()
-    except FileNotFoundError:
-        return []
-
-    if resolved in seen or not resolved.exists():
-        return []
-    seen.add(resolved)
-
-    paths = [resolved]
-    text = resolved.read_text()
-    for m in re.finditer(r'^\s*#\s*include\s+"([^"]+)"', text, flags=re.MULTILINE):
-        include_name = m.group(1)
-        candidates = [resolved.parent / include_name]
-        candidates.extend(include_dir / include_name for include_dir in include_dirs)
-        for candidate in candidates:
-            if candidate.exists():
-                paths.extend(_collect_visible_header_paths(candidate, include_dirs, seen))
-                break
-    return paths
-
-
-def _collect_source_include_headers(
-    source_path: str | Path,
-    include_dirs: list[Path] | None = None,
-) -> list[str]:
-    """Read local quoted headers included directly by a source file."""
-    source = Path(source_path)
-    if not source.exists():
-        return []
-
-    include_dirs = include_dirs or []
-    parts: list[str] = []
-    text = source.read_text()
-    for m in re.finditer(r'^\s*#\s*include\s+"([^"]+)"', text, flags=re.MULTILINE):
-        include_name = m.group(1)
-        candidates = [source.parent / include_name]
-        candidates.extend(include_dir / include_name for include_dir in include_dirs)
-        for candidate in candidates:
-            if candidate.exists():
-                parts.extend(_collect_visible_headers(candidate, include_dirs))
-                break
-    return parts
-
-
-def _source_include_names(source_path: str | Path) -> list[str]:
-    source = Path(source_path)
-    if not source.exists():
-        return []
-    text = source.read_text()
-    names: list[str] = []
-    for m in re.finditer(r'^\s*#\s*include\s+"([^"]+)"', text, flags=re.MULTILINE):
-        name = Path(m.group(1)).name
-        if name not in names:
-            names.append(name)
-    return names
-
-
-def _format_path_for_yaml(path: Path) -> str:
-    return os.path.relpath(path.resolve(), Path.cwd().resolve())
-
-
-def _suggest_extra_sources(
-    header_path: Path,
-    include_dirs: list[Path],
-    primary_source: str,
-) -> list[str]:
-    """Suggest .c files sitting next to recursively included project headers."""
-    primary = Path(primary_source)
-    try:
-        primary_resolved = primary.resolve()
-    except FileNotFoundError:
-        primary_resolved = primary
-
-    suggestions: list[str] = []
-    seen: set[str] = set()
-    for h in _collect_visible_header_paths(header_path, include_dirs):
-        c_path = h.with_suffix(".c")
-        if not c_path.exists():
-            continue
-        try:
-            if c_path.resolve() == primary_resolved:
-                continue
-        except FileNotFoundError:
-            pass
-        formatted = _format_path_for_yaml(c_path)
-        if formatted not in seen:
-            seen.add(formatted)
-            suggestions.append(formatted)
-    return suggestions
-
-
-def _dedupe_paths(paths: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for raw in paths:
-        path = Path(raw)
-        try:
-            key = str(path.resolve())
-        except FileNotFoundError:
-            key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(raw)
-    return result
-
-
 def _pointer_argument_setup(
     p: CParam,
     source_text: str | None = None,
@@ -942,145 +562,6 @@ def _append_len_data_shape(lines: list[str], arg: str) -> None:
         return
     lines.append(f"if ({arg}->len == 0) {arg}->len = 8;")
     lines.append(f"memset({arg}->data, 0, {arg}->len);")
-
-
-# ─── ACSL expression analysis ────────────────────────────────────────────────
-
-def _extract_null_params(assumes_exprs: list[str]) -> list[str]:
-    """
-    From ACSL assumes expressions like:
-        "iface == \\null" or "iface == \\null || frame == \\null"
-    Extract the parameter names that are asserted null.
-
-    Returns list of param names, e.g. ["iface", "frame"]
-    
-    Note: The ACSL text contains literal \\null (single backslash in C syntax).
-    In the parsed Python strings this becomes \null.
-    """
-    null_params: list[str] = []
-    for expr in assumes_exprs:
-        # Split on || and && to handle compound expressions
-        parts = re.split(r'\|\||&&', expr)
-        for part in parts:
-            # Match: param == \null (single backslash, literal from ACSL)
-            m = re.search(r'(\w+)\s*==\s*\\(?:null|NULL)\b', part.strip())
-            if m:
-                null_params.append(m.group(1))
-            # Match: \null == param
-            m = re.search(r'\\(?:null|NULL)\b\s*==\s*(\w+)', part.strip())
-            if m:
-                null_params.append(m.group(1))
-    return null_params
-
-
-def _extract_valid_params(assumes_exprs: list[str]) -> list[str]:
-    """
-    From ACSL assumes expressions like:
-        "\\valid(iface)" or "\\valid(iface) && \\valid(frame)"
-    Extract the parameter names that are asserted valid.
-
-    Note: ACSL uses \valid(...) which in the parsed Python strings 
-    appears as a single backslash.
-    """
-    valid_params: list[str] = []
-    for expr in assumes_exprs:
-        for m in re.finditer(r'\\(?:valid|valid_read)\((\w+)', expr):
-            valid_params.append(m.group(1))
-    return valid_params
-
-
-def _extract_non_null_params(assumes_exprs: list[str]) -> list[str]:
-    """Extract simple ACSL assumptions like `ctx != \null`."""
-    params: list[str] = []
-    for expr in assumes_exprs:
-        parts = re.split(r'\|\||&&', expr)
-        for part in parts:
-            part = part.strip()
-            m = re.search(r'(\w+)\s*!=\s*\\(?:null|NULL)\b', part)
-            if m:
-                params.append(m.group(1))
-            m = re.search(r'\\(?:null|NULL)\b\s*!=\s*(\w+)', part)
-            if m:
-                params.append(m.group(1))
-    return params
-
-
-def _extract_nonzero_params(assumes_exprs: list[str]) -> list[str]:
-    """Extract simple ACSL assumptions like `port != 0` or `bw > 0`."""
-    params: list[str] = []
-    for expr in assumes_exprs:
-        for part in re.split(r'\|\||&&', expr):
-            part = part.strip()
-            m = re.search(r'(\w+)\s*!=\s*0\b', part)
-            if m:
-                params.append(m.group(1))
-            m = re.search(r'\b0\s*!=\s*(\w+)', part)
-            if m:
-                params.append(m.group(1))
-            m = re.search(r'(\w+)\s*>\s*0\b', part)
-            if m:
-                params.append(m.group(1))
-            m = re.search(r'\b0\s*<\s*(\w+)', part)
-            if m:
-                params.append(m.group(1))
-    return params
-
-
-def _scalar_values_from_assumptions(assumes_exprs: list[str]) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for expr in assumes_exprs:
-        for part in re.split(r'\|\||&&', expr):
-            part = part.strip()
-            m = re.fullmatch(r'(\w+)\s*==\s*(0x[0-9a-fA-F]+|\d+)', part)
-            if m:
-                values[m.group(1)] = m.group(2)
-                continue
-            m = re.fullmatch(r'(0x[0-9a-fA-F]+|\d+)\s*==\s*(\w+)', part)
-            if m:
-                values[m.group(2)] = m.group(1)
-                continue
-            m = re.fullmatch(r'(\w+)\s*>\s*0\b', part)
-            if m:
-                values[m.group(1)] = "1"
-                continue
-            m = re.fullmatch(r'\b0\s*<\s*(\w+)', part)
-            if m:
-                values[m.group(1)] = "1"
-    return values
-
-
-def _extract_result_value(ensures_exprs: list[str]) -> int | None:
-    """
-    From ACSL ensures expressions like:
-        "\\result == -1" or "\\result == 0" or "\\result == 0xFFFF"
-    Extract the integer value (decimal or hex).
-
-    Returns the integer, or None if not found.
-
-    Note: ACSL uses \result which appears as a single backslash.
-    """
-    values: set[int] = set()
-    for expr in ensures_exprs:
-        simple = expr.strip()
-        while simple.startswith("(") and simple.endswith(")"):
-            inner = simple[1:-1].strip()
-            if not inner:
-                break
-            simple = inner
-
-        m = re.fullmatch(r'\\result\s*==\s*(0x[0-9a-fA-F]+|-?\d+)', simple)
-        if m:
-            raw = m.group(1)
-            values.add(int(raw, 16) if raw.lower().startswith("0x") else int(raw))
-            continue
-
-        m = re.fullmatch(r'(0x[0-9a-fA-F]+|-?\d+)\s*==\s*\\result', simple)
-        if m:
-            raw = m.group(1)
-            values.add(int(raw, 16) if raw.lower().startswith("0x") else int(raw))
-    if len(values) == 1:
-        return next(iter(values))
-    return None
 
 
 def _safe_c_name(text: str) -> str:
@@ -1665,26 +1146,6 @@ def _loop_table_candidates(
             ))
 
     return candidates
-
-
-def _split_call_args(args: str) -> list[str]:
-    out: list[str] = []
-    cur: list[str] = []
-    depth = 0
-    for ch in args:
-        if ch == "," and depth == 0:
-            out.append("".join(cur).strip())
-            cur = []
-            continue
-        cur.append(ch)
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}" and depth > 0:
-            depth -= 1
-    tail = "".join(cur).strip()
-    if tail:
-        out.append(tail)
-    return out
 
 
 def _infer_lookup_shape(
