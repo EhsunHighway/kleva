@@ -18,11 +18,34 @@ from __future__ import annotations
 import re
 import sys
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from .acsl import ACSLSpec, ACSLBehavior
+from .ast.model import CFunction, CFunctionPointerTypedef, CParam, CTypeCatalog, DerivedLocal
 from .config import resolve_klee_clang, resolve_klee_include, resolve_llvm_link
+from .shaping.byte_order import (
+    decoded_field_aliases as _byte_order_decoded_field_aliases,
+    host_to_network_fn as _byte_order_host_to_network_fn,
+    propagate_local_aliases as _byte_order_propagate_local_aliases,
+)
+from .shaping.candidates import BranchCandidate
+from .shaping.lookups import (
+    FallbackLookupOps,
+    LookupInferOps,
+    LookupSetupOps,
+    LookupShape,
+    fallback_lookup_candidates as _lookup_shaper_fallback_lookup_candidates,
+    infer_lookup_shape as _lookup_shaper_infer_lookup_shape,
+    infer_lookup_shape_for_call as _lookup_shaper_infer_lookup_shape_for_call,
+    lookup_condition_setup as _lookup_shaper_condition_setup,
+    lookup_miss_setup as _lookup_shaper_miss_setup,
+)
+from .shaping.switches import (
+    StateSwitchOps,
+    state_switch_candidates as _switch_shaper_state_switch_candidates,
+    switch_case_blocks as _switch_shaper_case_blocks,
+)
 
 
 # ── C type knowledge ──────────────────────────────────────────────────────────
@@ -45,6 +68,7 @@ SHAPING_FEATURES = {
     "loop-tables",
     "state-switches",
     "callee-success",
+    "fallback-lookups",
 }
 DEFAULT_SHAPING_FEATURES = frozenset(SHAPING_FEATURES)
 
@@ -84,72 +108,6 @@ def normalize_shaping_features(
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unknown shaping feature(s): {names}")
     return enabled
-
-
-# ── Data model (moved from init.py) ───────────────────────────────────────────
-
-@dataclass
-class CParam:
-    name:        str
-    raw_type:    str   # exactly as written, e.g. "const uint8_t *"
-    base_type:   str   # e.g. "uint8_t", "Buffer"
-    is_pointer:  bool
-    is_const:    bool
-    is_array:    bool  # e.g. "const uint8_t mac[6]"
-    array_size:  int   # 0 if not an array
-
-
-@dataclass
-class CFunction:
-    name:              str
-    return_type:       str   # e.g. "Link *", "int", "void"
-    return_base:       str   # stripped, e.g. "Link", "int"
-    return_is_pointer: bool
-    params:            list[CParam]
-
-
-@dataclass
-class BranchCandidate:
-    """A source-derived path goal that can be added to a valid fixture."""
-    name:              str
-    setup:             list[str]
-    preamble:          list[str] = field(default_factory=list)
-    oracle:            bool = True
-    witness_outputs:   bool = False
-
-
-@dataclass(frozen=True)
-class DerivedLocal:
-    """A local variable computed from another expression in the source body."""
-    kind: str
-    base: str
-    arg:  str
-
-
-@dataclass
-class CFunctionPointerTypedef:
-    """A typedef'd function pointer such as `typedef void (*Cb)(int);`."""
-    name:        str
-    return_type: str
-    params:      list[CParam]
-
-
-@dataclass
-class CTypeCatalog:
-    """Facts inferred from visible C declarations."""
-    complete_structs: set[str] = field(default_factory=set)
-    opaque_structs:   set[str] = field(default_factory=set)
-    function_pointers: dict[str, CFunctionPointerTypedef] = field(default_factory=dict)
-    struct_fields: dict[str, dict[str, CParam]] = field(default_factory=dict)
-
-    def is_complete_struct(self, type_name: str) -> bool:
-        return type_name in self.complete_structs
-
-    def function_pointer(self, type_name: str) -> CFunctionPointerTypedef | None:
-        return self.function_pointers.get(type_name)
-
-    def field_type(self, type_name: str, field_name: str) -> CParam | None:
-        return self.struct_fields.get(type_name, {}).get(field_name)
 
 
 # ── C header parser (moved from init.py) ──────────────────────────────────────
@@ -1417,34 +1375,11 @@ def _cast_alias_backing_setup(alias: str, cast_type: str, expr: str, params: dic
 
 
 def _propagate_local_aliases(body: str, aliases: dict) -> dict:
-    changed = True
-    while changed:
-        changed = False
-        for m in re.finditer(
-            r"\b(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)\s+(\w+)\s*=\s*(\w+)\s*;",
-            body,
-        ):
-            dst, src = m.groups()
-            if src in aliases and dst not in aliases:
-                aliases[dst] = aliases[src]
-                changed = True
-        for m in re.finditer(r"\b(\w+)\s*=\s*(\w+)\s*;", body):
-            dst, src = m.groups()
-            if src in aliases and dst not in aliases:
-                aliases[dst] = aliases[src]
-                changed = True
-    return aliases
+    return _byte_order_propagate_local_aliases(body, aliases)
 
 
 def _decoded_field_aliases(body: str) -> dict[str, tuple[str, str, str]]:
-    decoded: dict[str, tuple[str, str, str]] = {}
-    for m in re.finditer(
-        r"\b(?:uint(?:8|16|32|64)_t|int(?:8|16|32|64)_t|size_t|int)\s+(\w+)\s*=\s*(ns_ntohs|ntohs|ns_ntohl|ntohl)\s*\(\s*(\w+)->(\w+)\s*\)\s*;",
-        body,
-    ):
-        local, fn, alias, field = m.groups()
-        decoded[local] = (fn, alias, field)
-    return _propagate_local_aliases(body, decoded)
+    return _byte_order_decoded_field_aliases(body)
 
 
 def _direct_field_aliases(body: str) -> dict[str, tuple[str, str]]:
@@ -1752,83 +1687,34 @@ def _split_call_args(args: str) -> list[str]:
     return out
 
 
-@dataclass
-class LookupShape:
-    callee:         str
-    result_var:     str
-    element_type:   str
-    element_alias:  str
-    container_type: str
-    container_expr: str
-    array_field:    str
-    param_args:     dict[str, str]
-    conditions:     list[str]
-
-
 def _infer_lookup_shape(
     caller_body: str,
     source_text: str | None,
     type_catalog: CTypeCatalog | None,
 ) -> list[LookupShape]:
-    if not source_text or not type_catalog:
-        return []
-
-    shapes: list[LookupShape] = []
-    function_decls = _function_decl_map(source_text)
-
-    call_pat = re.compile(
-        r"\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*"
-        r"([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;"
+    return _lookup_shaper_infer_lookup_shape(
+        caller_body,
+        source_text,
+        type_catalog,
+        LookupInferOps(_function_decl_map, _function_body, _split_call_args),
     )
-    for m in call_pat.finditer(caller_body):
-        result_type, result_var, callee, args_raw = m.groups()
-        if not re.search(rf"\bswitch\s*\(\s*{re.escape(result_var)}->\w+\s*\)", caller_body):
-            continue
 
-        callee_body = _function_body(source_text, callee)
-        callee_decl = function_decls.get(callee)
-        if not callee_body or not callee_decl:
-            continue
 
-        args = _split_call_args(args_raw)
-        if len(args) != len(callee_decl.params):
-            continue
-        param_args = {p.name: a for p, a in zip(callee_decl.params, args)}
-
-        alias_pat = re.compile(
-            r"\b([A-Za-z_]\w*)\s*\*\s*([A-Za-z_]\w*)\s*=\s*&"
-            r"\s*([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*\[\s*[A-Za-z_]\w*\s*\]\s*;"
-        )
-        for a in alias_pat.finditer(callee_body):
-            element_type, element_alias, container_param, array_field = a.groups()
-            if element_type != result_type:
-                continue
-            if not re.search(rf"\breturn\s+{re.escape(element_alias)}\s*;", callee_body):
-                continue
-            container_decl = next((p for p in callee_decl.params if p.name == container_param), None)
-            if not container_decl:
-                continue
-            container_expr = param_args.get(container_param)
-            if not container_expr:
-                continue
-
-            conditions: list[str] = []
-            for cond in re.findall(rf"{re.escape(element_alias)}->[^{{;]+", callee_body):
-                conditions.append(cond.strip())
-
-            shapes.append(LookupShape(
-                callee=callee,
-                result_var=result_var,
-                element_type=element_type,
-                element_alias=element_alias,
-                container_type=container_decl.base_type,
-                container_expr=container_expr,
-                array_field=array_field,
-                param_args=param_args,
-                conditions=conditions,
-            ))
-
-    return shapes
+def _infer_lookup_shape_for_call(
+    callee: str,
+    result_var: str,
+    args_raw: str,
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+) -> LookupShape | None:
+    return _lookup_shaper_infer_lookup_shape_for_call(
+        callee,
+        result_var,
+        args_raw,
+        source_text,
+        type_catalog,
+        LookupInferOps(_function_decl_map, _function_body, _split_call_args),
+    )
 
 
 def _setup_decoded_local(
@@ -1903,6 +1789,24 @@ def _rewrite_result_expr(
     result_expr: str,
 ) -> str:
     return re.sub(rf"\b{re.escape(result_var)}->", f"{result_expr}.", expr.strip())
+
+
+def _rewrite_source_alias_exprs(
+    line: str,
+    aliases: dict[str, tuple[str, str]],
+    result_var: str | None = None,
+    result_expr: str | None = None,
+) -> str:
+    out = line
+    if result_var and result_expr:
+        out = re.sub(rf"\b{re.escape(result_var)}->", f"{result_expr}.", out)
+    for alias, (cast_type, expr) in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+        out = re.sub(
+            rf"\b{re.escape(alias)}->",
+            f"(({cast_type} *){expr})->",
+            out,
+        )
+    return out
 
 
 def _condition_setup_lines(
@@ -2009,18 +1913,57 @@ def _condition_function_pointer_setup(
     return setup, preamble
 
 
+def _callee_success_setups_in_block(
+    block: str,
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+) -> tuple[list[str], list[str]]:
+    """Return structural setup that makes visible checked callees succeed."""
+    if not source_text or not type_catalog:
+        return [], []
+
+    setup: list[str] = []
+    preamble: list[str] = []
+    seen_setup: set[str] = set()
+    seen_preamble: set[str] = set()
+
+    patterns = [
+        re.compile(
+            r"\bint\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;\s*"
+            r"if\s*\(\s*\1\s*==\s*-1\s*\)",
+            flags=re.DOTALL,
+        ),
+        re.compile(
+            r"\bif\s*\(\s*([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*==\s*-1\s*\)",
+            flags=re.DOTALL,
+        ),
+    ]
+
+    calls: list[tuple[str, str]] = []
+    for m in patterns[0].finditer(block):
+        _result_var, callee, args_raw = m.groups()
+        calls.append((callee, args_raw))
+    for m in patterns[1].finditer(block):
+        callee, args_raw = m.groups()
+        calls.append((callee, args_raw))
+
+    for callee, args_raw in calls:
+        callee_setup, callee_preamble = _callee_success_setup_for_call(
+            callee,
+            _split_call_args(args_raw),
+            source_text,
+            type_catalog,
+        )
+        for line in callee_setup:
+            _append_unique(setup, line, seen_setup)
+        for line in callee_preamble:
+            _append_unique(preamble, line, seen_preamble)
+
+    return setup, preamble
+
+
 def _switch_case_blocks(body: str, switch_start: int) -> list[tuple[str, str]]:
-    tail = body[switch_start:]
-    case_iter = list(re.finditer(r"\bcase\s+([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*:", tail))
-    blocks: list[tuple[str, str]] = []
-    for i, m in enumerate(case_iter):
-        start = m.end()
-        end = case_iter[i + 1].start() if i + 1 < len(case_iter) else len(tail)
-        default_m = re.search(r"\bdefault\s*:", tail[start:end])
-        if default_m:
-            end = start + default_m.start()
-        blocks.append((m.group(1), tail[start:end]))
-    return blocks
+    return _switch_shaper_case_blocks(body, switch_start)
 
 
 def _lookup_container_setup(
@@ -2089,38 +2032,33 @@ def _lookup_condition_setup(
     direct_aliases: dict[str, tuple[str, str]],
     derived_aliases: dict[str, DerivedLocal],
 ) -> list[str]:
-    setup: list[str] = []
-    seen: set[str] = set()
-    container_expr = _expand_alias_expr(shape.container_expr, aliases)
-    elem = f"{container_expr}->{shape.array_field}[0]"
+    return _lookup_shaper_condition_setup(
+        shape,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        LookupSetupOps(_expand_alias_expr, _append_unique, _setup_local_value, _nonmatching_value),
+    )
 
-    for cond in shape.conditions:
-        for field, rhs in re.findall(
-            rf"{re.escape(shape.element_alias)}->(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
-            cond,
-        ):
-            value = "1"
-            if rhs in shape.param_args:
-                arg = shape.param_args[rhs]
-                _append_unique(setup, f"{elem}.{field} = {value};", seen)
-                for line in _setup_local_value(arg, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
-                    _append_unique(setup, line, seen)
-            else:
-                _append_unique(setup, f"{elem}.{field} = {rhs};", seen)
 
-        for field in re.findall(
-            rf"{re.escape(shape.element_alias)}->(\w+)(?:\s*&&|\s*\)|\s*$)",
-            cond,
-        ):
-            _append_unique(setup, f"{elem}.{field} = 1;", seen)
-
-        for field, rhs in re.findall(
-            rf"{re.escape(shape.element_alias)}->(\w+)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
-            cond,
-        ):
-            _append_unique(setup, f"{elem}.{field} = {_nonmatching_value(rhs)};", seen)
-
-    return setup
+def _lookup_miss_setup(
+    exact_shape: LookupShape,
+    hit_shape: LookupShape,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal],
+) -> list[str]:
+    return _lookup_shaper_miss_setup(
+        exact_shape,
+        hit_shape,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        LookupSetupOps(_expand_alias_expr, _append_unique, _setup_local_value, _nonmatching_value),
+    )
 
 
 def _state_switch_candidates(
@@ -2135,52 +2073,64 @@ def _state_switch_candidates(
 ) -> list[BranchCandidate]:
     if shaping_features is None:
         shaping_features = set(DEFAULT_SHAPING_FEATURES)
-    if "state-switches" not in shaping_features or not type_catalog:
-        return []
+    return _switch_shaper_state_switch_candidates(
+        body,
+        source_text,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        type_catalog,
+        shaping_features,
+        StateSwitchOps(
+            _infer_lookup_shape,
+            _good_path_setup_from_source,
+            _alias_pointer_guard_setup,
+            _lookup_container_setup,
+            _lookup_condition_setup,
+            _expand_alias_expr,
+            _condition_setup_lines,
+            _condition_function_pointer_setup,
+            _callee_success_setups_in_block,
+            _rewrite_source_alias_exprs,
+            _safe_c_name,
+        ),
+    )
 
-    candidates: list[BranchCandidate] = []
-    for shape in _infer_lookup_shape(body, source_text, type_catalog):
-        for m in re.finditer(rf"switch\s*\(\s*{re.escape(shape.result_var)}->(\w+)\s*\)", body):
-            switch_field = m.group(1)
-            for case, case_body in _switch_case_blocks(body, m.end()):
-                setup = []
-                setup.extend(_good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases, derived_aliases))
-                setup.extend(_alias_pointer_guard_setup(body, aliases, type_catalog, {shape.container_expr}))
-                setup.extend(_lookup_container_setup(shape, aliases, type_catalog))
-                setup.extend(_lookup_condition_setup(shape, aliases, decoded_aliases, direct_aliases, derived_aliases))
-                container_expr = _expand_alias_expr(shape.container_expr, aliases)
-                setup.append(f"{container_expr}->{shape.array_field}[0].{switch_field} = {case};")
-                candidates.append(BranchCandidate(
-                    _safe_c_name(f"source_{shape.result_var}_{switch_field}_{case}"),
-                    setup,
-                ))
-                result_expr = f"{container_expr}->{shape.array_field}[0]"
-                for idx, cond in enumerate(re.findall(r"\bif\s*\(([^{};]+)\)", case_body), 1):
-                    cond_setup = _condition_setup_lines(
-                        cond,
-                        aliases,
-                        decoded_aliases,
-                        direct_aliases,
-                        derived_aliases,
-                        shape.result_var,
-                        result_expr,
-                    )
-                    fp_setup, fp_preamble = _condition_function_pointer_setup(
-                        cond,
-                        shape.result_var,
-                        result_expr,
-                        shape.element_type,
-                        type_catalog,
-                    )
-                    if not cond_setup and not fp_setup:
-                        continue
-                    candidates.append(BranchCandidate(
-                        _safe_c_name(f"source_{shape.result_var}_{switch_field}_{case}_guard_{idx}"),
-                        [*setup, *cond_setup, *fp_setup],
-                        fp_preamble,
-                    ))
 
-    return candidates
+def _fallback_lookup_candidates(
+    body: str,
+    source_text: str | None,
+    aliases: dict[str, tuple[str, str]],
+    decoded_aliases: dict[str, tuple[str, str, str]],
+    direct_aliases: dict[str, tuple[str, str]],
+    derived_aliases: dict[str, DerivedLocal],
+    type_catalog: CTypeCatalog | None,
+    shaping_features: set[str] | None = None,
+) -> list[BranchCandidate]:
+    if shaping_features is None:
+        shaping_features = set(DEFAULT_SHAPING_FEATURES)
+    return _lookup_shaper_fallback_lookup_candidates(
+        body,
+        source_text,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        type_catalog,
+        shaping_features,
+        LookupInferOps(_function_decl_map, _function_body, _split_call_args),
+        FallbackLookupOps(
+            _strip_comments,
+            _good_path_setup_from_source,
+            _alias_pointer_guard_setup,
+            _condition_setup_lines,
+            _lookup_container_setup,
+            _lookup_condition_setup,
+            _lookup_miss_setup,
+            _safe_c_name,
+        ),
+    )
 
 
 def _is_assignable_expr(expr: str) -> bool:
@@ -2192,87 +2142,6 @@ def _assign_nonzero_if_lvalue(expr: str) -> list[str]:
     if "->" not in expr or not _is_assignable_expr(expr):
         return []
     return [f"if ({expr} == 0) {expr} = 1;"]
-
-
-def _has_field(type_catalog: CTypeCatalog | None, type_name: str, field_name: str, base_type: str | None = None) -> bool:
-    if not type_catalog:
-        return False
-    field = type_catalog.field_type(type_name, field_name)
-    if not field:
-        return False
-    return base_type is None or field.base_type == base_type
-
-
-def _simulator_packet_output_success_setup(
-    sim_expr: str,
-    src_expr: str,
-    dst_expr: str,
-    type_catalog: CTypeCatalog | None,
-) -> tuple[list[str], list[str]]:
-    """
-    Build the small object graph needed by a visible simulator-output callee.
-
-    This is intentionally structural: it checks for the types/fields used by
-    the visible C code instead of keying on one protocol function name.
-    """
-    if not type_catalog:
-        return [], []
-
-    required = (
-        _has_field(type_catalog, "Simulator", "topo", "Topology") and
-        _has_field(type_catalog, "Simulator", "sched", "Scheduler") and
-        _has_field(type_catalog, "Topology", "devices", "Device") and
-        _has_field(type_catalog, "Topology", "dev_count") and
-        _has_field(type_catalog, "Device", "interfaces", "Interface") and
-        _has_field(type_catalog, "Device", "iface_count") and
-        _has_field(type_catalog, "Interface", "ip_addr") and
-        _has_field(type_catalog, "Interface", "up") and
-        _has_field(type_catalog, "Interface", "link", "Link") and
-        _has_field(type_catalog, "Interface", "arp_cache", "ArpCache") and
-        _has_field(type_catalog, "Link", "end_a", "Interface") and
-        _has_field(type_catalog, "Link", "end_b", "Interface") and
-        _has_field(type_catalog, "Link", "up")
-    )
-    if not required:
-        return [], []
-
-    lines: list[str] = []
-    seen: set[str] = set()
-    for line in _assign_nonzero_if_lvalue(src_expr):
-        _append_unique(lines, line, seen)
-    for line in _assign_nonzero_if_lvalue(dst_expr):
-        _append_unique(lines, line, seen)
-
-    _append_unique(lines, "Device kleva_success_dev;", seen)
-    _append_unique(lines, "memset(&kleva_success_dev, 0, sizeof(kleva_success_dev));", seen)
-    _append_unique(lines, "Interface kleva_success_iface;", seen)
-    _append_unique(lines, "memset(&kleva_success_iface, 0, sizeof(kleva_success_iface));", seen)
-    _append_unique(lines, "Interface kleva_success_peer;", seen)
-    _append_unique(lines, "memset(&kleva_success_peer, 0, sizeof(kleva_success_peer));", seen)
-    _append_unique(lines, "Interface *kleva_success_ifaces[1] = {&kleva_success_iface};", seen)
-    _append_unique(lines, "Link kleva_success_link;", seen)
-    _append_unique(lines, "memset(&kleva_success_link, 0, sizeof(kleva_success_link));", seen)
-    _append_unique(lines, "ArpCache kleva_success_arp;", seen)
-    _append_unique(lines, "memset(&kleva_success_arp, 0, sizeof(kleva_success_arp));", seen)
-
-    _append_unique(lines, f"if ({sim_expr}->topo) {{ {sim_expr}->topo->devices[0] = &kleva_success_dev; {sim_expr}->topo->dev_count = 1; }}", seen)
-    _append_unique(lines, "kleva_success_dev.interfaces = kleva_success_ifaces;", seen)
-    _append_unique(lines, "kleva_success_dev.iface_count = 1;", seen)
-    _append_unique(lines, "kleva_success_dev.iface_max = 1;", seen)
-    _append_unique(lines, f"kleva_success_iface.ip_addr = ns_htonl({src_expr});", seen)
-    _append_unique(lines, "kleva_success_iface.prefix_len = 0;", seen)
-    _append_unique(lines, "kleva_success_iface.up = 1;", seen)
-    _append_unique(lines, "kleva_success_iface.device = &kleva_success_dev;", seen)
-    _append_unique(lines, "kleva_success_iface.link = &kleva_success_link;", seen)
-    _append_unique(lines, "kleva_success_iface.arp_cache = &kleva_success_arp;", seen)
-    _append_unique(lines, "kleva_success_peer.up = 1;", seen)
-    _append_unique(lines, "kleva_success_link.end_a = &kleva_success_iface;", seen)
-    _append_unique(lines, "kleva_success_link.end_b = &kleva_success_peer;", seen)
-    _append_unique(lines, "kleva_success_link.up = 1;", seen)
-    _append_unique(lines, "kleva_success_arp.entries[0].valid = 1;", seen)
-    _append_unique(lines, f"kleva_success_arp.entries[0].ip_addr = {dst_expr};", seen)
-    _append_unique(lines, "memset(kleva_success_arp.entries[0].mac_addr, 0xA5, sizeof(kleva_success_arp.entries[0].mac_addr));", seen)
-    return lines, ['#include "arp_cache.h"']
 
 
 def _callee_success_setup_for_call(
@@ -2291,24 +2160,16 @@ def _callee_success_setup_for_call(
         return [], []
 
     arg_by_param = {p.name: a for p, a in zip(callee_decl.params, args)}
-    for downstream, downstream_args_raw in re.findall(r"\b([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*;", callee_body):
-        downstream_body = _function_definition_body(source_text, downstream)
-        downstream_decl = function_decls.get(downstream)
-        if not downstream_body or not downstream_decl:
-            continue
-        if "ip_find_source_iface" not in downstream_body and "arp_cache_lookup" not in downstream_body:
-            continue
-
-        downstream_args = _split_call_args(downstream_args_raw)
-        if len(downstream_args) < 3:
-            continue
-        mapped = [arg_by_param.get(a.strip(), a.strip()) for a in downstream_args[:3]]
-        sim_expr, src_expr, dst_expr = mapped
-        if not _is_assignable_expr(sim_expr):
-            continue
-        return _simulator_packet_output_success_setup(sim_expr, src_expr, dst_expr, type_catalog)
-
-    return [], []
+    visible_roots = set(arg_by_param.values())
+    setup: list[str] = []
+    seen: set[str] = set()
+    for condition in _return_guard_conditions(callee_body):
+        rewritten = condition
+        for param, arg in sorted(arg_by_param.items(), key=lambda item: len(item[0]), reverse=True):
+            rewritten = re.sub(rf"\b{re.escape(param)}\b", arg, rewritten)
+        for line in _invert_simple_return_guard(rewritten, visible_roots):
+            _append_unique(setup, line, seen)
+    return setup, []
 
 
 def _return_guard_conditions(prefix: str) -> list[str]:
@@ -2488,11 +2349,7 @@ def _callee_success_candidates(
 
 
 def _host_to_network_fn(decode_fn: str) -> str:
-    if decode_fn in {"ns_ntohs", "ntohs"}:
-        return "ns_htons"
-    if decode_fn in {"ns_ntohl", "ntohl"}:
-        return "ns_htonl"
-    return ""
+    return _byte_order_host_to_network_fn(decode_fn)
 
 
 def _nonmatching_value(value: str) -> str:
@@ -2654,6 +2511,12 @@ def _source_branch_candidates(
         candidates.append(candidate)
 
     for candidate in _state_switch_candidates(body, source_text, aliases, decoded_aliases, direct_aliases, derived_aliases, type_catalog, shaping_features):
+        if candidate.name in seen_names:
+            continue
+        seen_names.add(candidate.name)
+        candidates.append(candidate)
+
+    for candidate in _fallback_lookup_candidates(body, source_text, aliases, decoded_aliases, direct_aliases, derived_aliases, type_catalog, shaping_features):
         if candidate.name in seen_names:
             continue
         seen_names.add(candidate.name)
