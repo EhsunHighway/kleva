@@ -79,6 +79,25 @@ from .shaping.assumptions import (
     assumption_setup_lines as _assumption_shaper_setup_lines,
 )
 from .shaping.candidates import BranchCandidate
+from .shaping.callees import (
+    CalleeSuccessOps,
+    callee_success_candidates as _callee_shaper_success_candidates,
+    callee_success_setup_for_call as _callee_shaper_success_setup_for_call,
+    callee_success_setups_in_block as _callee_shaper_success_setups_in_block,
+    invert_simple_return_guard as _callee_shaper_invert_simple_return_guard,
+    return_guard_conditions as _callee_shaper_return_guard_conditions,
+    source_guard_setup_before_call as _callee_shaper_source_guard_setup_before_call,
+)
+from .shaping.conditions import (
+    ConditionSetupOps,
+    FunctionPointerConditionOps,
+    condition_function_pointer_setup as _condition_shaper_function_pointer_setup,
+    condition_setup_lines as _condition_shaper_setup_lines,
+    rewrite_result_expr as _condition_shaper_rewrite_result_expr,
+    rewrite_source_alias_exprs as _condition_shaper_rewrite_source_alias_exprs,
+    split_conjuncts as _condition_shaper_split_conjuncts,
+    strip_outer_parens as _condition_shaper_strip_outer_parens,
+)
 from .shaping.lookups import (
     FallbackLookupOps,
     LookupInferOps,
@@ -679,50 +698,11 @@ def _setup_decoded_local(
 
 
 def _split_conjuncts(expr: str) -> list[str]:
-    parts: list[str] = []
-    cur: list[str] = []
-    depth = 0
-    i = 0
-    while i < len(expr):
-        ch = expr[i]
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}" and depth > 0:
-            depth -= 1
-        if depth == 0 and expr[i:i + 2] == "&&":
-            part = "".join(cur).strip()
-            if part:
-                parts.append(part)
-            cur = []
-            i += 2
-            continue
-        cur.append(ch)
-        i += 1
-    tail = "".join(cur).strip()
-    if tail:
-        parts.append(tail)
-    return parts
+    return _condition_shaper_split_conjuncts(expr)
 
 
 def _strip_outer_parens(expr: str) -> str:
-    out = expr.strip()
-    changed = True
-    while changed and out.startswith("(") and out.endswith(")"):
-        changed = False
-        depth = 0
-        balanced_outer = True
-        for i, ch in enumerate(out):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0 and i != len(out) - 1:
-                    balanced_outer = False
-                    break
-        if balanced_outer:
-            out = out[1:-1].strip()
-            changed = True
-    return out
+    return _condition_shaper_strip_outer_parens(expr)
 
 
 def _rewrite_result_expr(
@@ -730,7 +710,7 @@ def _rewrite_result_expr(
     result_var: str,
     result_expr: str,
 ) -> str:
-    return re.sub(rf"\b{re.escape(result_var)}->", f"{result_expr}.", expr.strip())
+    return _condition_shaper_rewrite_result_expr(expr, result_var, result_expr)
 
 
 def _rewrite_source_alias_exprs(
@@ -739,16 +719,7 @@ def _rewrite_source_alias_exprs(
     result_var: str | None = None,
     result_expr: str | None = None,
 ) -> str:
-    out = line
-    if result_var and result_expr:
-        out = re.sub(rf"\b{re.escape(result_var)}->", f"{result_expr}.", out)
-    for alias, (cast_type, expr) in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        out = re.sub(
-            rf"\b{re.escape(alias)}->",
-            f"(({cast_type} *){expr})->",
-            out,
-        )
-    return out
+    return _condition_shaper_rewrite_source_alias_exprs(line, aliases, result_var, result_expr)
 
 
 def _condition_setup_lines(
@@ -760,58 +731,16 @@ def _condition_setup_lines(
     result_var: str | None = None,
     result_expr: str | None = None,
 ) -> list[str]:
-    setup: list[str] = []
-    seen: set[str] = set()
-
-    for raw_part in _split_conjuncts(condition):
-        part = _strip_outer_parens(raw_part)
-
-        m = re.fullmatch(r"(\w+)\s*&\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
-        if m:
-            local, value = m.groups()
-            for line in _setup_local_bitwise_or(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
-                _append_unique(setup, line, seen)
-            continue
-
-        m = re.fullmatch(r"!\s*\(\s*(\w+)\s*&\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)\s*\)", part)
-        if m:
-            local, _value = m.groups()
-            for line in _setup_local_value(local, "0", aliases, decoded_aliases, direct_aliases, derived_aliases):
-                _append_unique(setup, line, seen)
-            continue
-
-        m = re.fullmatch(
-            r"(\w+)\s*(==|!=|>|>=|<|<=)\s*([A-Za-z_]\w*(?:->\w+)?|0x[0-9a-fA-F]+|\d+)",
-            part,
-        )
-        if m:
-            local, op, rhs = m.groups()
-            if result_var and result_expr:
-                rhs = _rewrite_result_expr(rhs, result_var, result_expr)
-            if op == "==":
-                value = rhs
-            elif op == "!=":
-                value = _nonmatching_value(rhs)
-            elif op == ">":
-                value = f"(({rhs}) + 1)"
-            elif op == ">=":
-                value = rhs
-            elif op == "<":
-                value = f"(({rhs}) > 0 ? ({rhs}) - 1 : 0)"
-            else:
-                value = rhs
-            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
-                _append_unique(setup, line, seen)
-            continue
-
-        m = re.fullmatch(r"(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
-        if m:
-            local, value = m.groups()
-            for line in _setup_local_value(local, value, aliases, decoded_aliases, direct_aliases, derived_aliases):
-                _append_unique(setup, line, seen)
-            continue
-
-    return setup
+    return _condition_shaper_setup_lines(
+        condition,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        ConditionSetupOps(_setup_local_bitwise_or, _setup_local_value, _append_unique, _nonmatching_value),
+        result_var,
+        result_expr,
+    )
 
 
 def _condition_function_pointer_setup(
@@ -821,38 +750,32 @@ def _condition_function_pointer_setup(
     result_type: str,
     type_catalog: CTypeCatalog | None,
 ) -> tuple[list[str], list[str]]:
-    """Shape `if (obj->callback)` style guards for function-pointer fields."""
-    if not type_catalog:
-        return [], []
+    return _condition_shaper_function_pointer_setup(
+        condition,
+        result_var,
+        result_expr,
+        result_type,
+        type_catalog,
+        FunctionPointerConditionOps(
+            _split_conjuncts,
+            _strip_outer_parens,
+            _append_unique,
+            _function_pointer_stub_preamble,
+            _function_pointer_stub_name,
+        ),
+    )
 
-    setup: list[str] = []
-    preamble: list[str] = []
-    seen_setup: set[str] = set()
-    seen_preamble: set[str] = set()
 
-    for raw_part in _split_conjuncts(condition):
-        part = _strip_outer_parens(raw_part)
-        m = re.fullmatch(rf"{re.escape(result_var)}->([A-Za-z_]\w*)", part)
-        if not m:
-            continue
-
-        field = m.group(1)
-        field_param = type_catalog.field_type(result_type, field)
-        if not field_param:
-            continue
-        fp_decl = type_catalog.function_pointer(field_param.base_type)
-        if not fp_decl:
-            continue
-
-        for line in _function_pointer_stub_preamble(fp_decl):
-            _append_unique(preamble, line, seen_preamble)
-        _append_unique(
-            setup,
-            f"{result_expr}.{field} = {_function_pointer_stub_name(fp_decl.name)};",
-            seen_setup,
-        )
-
-    return setup, preamble
+def _callee_success_ops() -> CalleeSuccessOps:
+    return CalleeSuccessOps(
+        _function_decl_map,
+        _function_definition_body,
+        _split_call_args,
+        _append_unique,
+        _nonmatching_value,
+        _literal_or_macro_value,
+        _safe_c_name,
+    )
 
 
 def _callee_success_setups_in_block(
@@ -860,48 +783,7 @@ def _callee_success_setups_in_block(
     source_text: str | None,
     type_catalog: CTypeCatalog | None,
 ) -> tuple[list[str], list[str]]:
-    """Return structural setup that makes visible checked callees succeed."""
-    if not source_text or not type_catalog:
-        return [], []
-
-    setup: list[str] = []
-    preamble: list[str] = []
-    seen_setup: set[str] = set()
-    seen_preamble: set[str] = set()
-
-    patterns = [
-        re.compile(
-            r"\bint\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;\s*"
-            r"if\s*\(\s*\1\s*==\s*-1\s*\)",
-            flags=re.DOTALL,
-        ),
-        re.compile(
-            r"\bif\s*\(\s*([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*==\s*-1\s*\)",
-            flags=re.DOTALL,
-        ),
-    ]
-
-    calls: list[tuple[str, str]] = []
-    for m in patterns[0].finditer(block):
-        _result_var, callee, args_raw = m.groups()
-        calls.append((callee, args_raw))
-    for m in patterns[1].finditer(block):
-        callee, args_raw = m.groups()
-        calls.append((callee, args_raw))
-
-    for callee, args_raw in calls:
-        callee_setup, callee_preamble = _callee_success_setup_for_call(
-            callee,
-            _split_call_args(args_raw),
-            source_text,
-            type_catalog,
-        )
-        for line in callee_setup:
-            _append_unique(setup, line, seen_setup)
-        for line in callee_preamble:
-            _append_unique(preamble, line, seen_preamble)
-
-    return setup, preamble
+    return _callee_shaper_success_setups_in_block(block, source_text, type_catalog, _callee_success_ops())
 
 
 def _switch_case_blocks(body: str, switch_start: int) -> list[tuple[str, str]]:
@@ -1092,125 +974,19 @@ def _callee_success_setup_for_call(
     source_text: str | None,
     type_catalog: CTypeCatalog | None,
 ) -> tuple[list[str], list[str]]:
-    if not source_text or not type_catalog:
-        return [], []
-
-    function_decls = _function_decl_map(source_text)
-    callee_decl = function_decls.get(callee)
-    callee_body = _function_definition_body(source_text, callee)
-    if not callee_decl or not callee_body or len(args) != len(callee_decl.params):
-        return [], []
-
-    arg_by_param = {p.name: a for p, a in zip(callee_decl.params, args)}
-    visible_roots = set(arg_by_param.values())
-    setup: list[str] = []
-    seen: set[str] = set()
-    for condition in _return_guard_conditions(callee_body):
-        rewritten = condition
-        for param, arg in sorted(arg_by_param.items(), key=lambda item: len(item[0]), reverse=True):
-            rewritten = re.sub(rf"\b{re.escape(param)}\b", arg, rewritten)
-        for line in _invert_simple_return_guard(rewritten, visible_roots):
-            _append_unique(setup, line, seen)
-    return setup, []
+    return _callee_shaper_success_setup_for_call(callee, args, source_text, type_catalog, _callee_success_ops())
 
 
 def _return_guard_conditions(prefix: str) -> list[str]:
-    conditions: list[str] = []
-    i = 0
-    while i < len(prefix):
-        m = re.search(r"\bif\s*\(", prefix[i:])
-        if not m:
-            break
-        cond_start = i + m.end()
-        depth = 1
-        j = cond_start
-        while j < len(prefix) and depth > 0:
-            ch = prefix[j]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            j += 1
-        if depth != 0:
-            break
-
-        condition = prefix[cond_start:j - 1].strip()
-        following = prefix[j:j + 300]
-        if re.match(r"\s*return\b", following) or re.match(r"\s*\{[^{}]*\breturn\b", following, flags=re.DOTALL):
-            conditions.append(condition)
-        i = j
-    return conditions
+    return _callee_shaper_return_guard_conditions(prefix)
 
 
 def _invert_simple_return_guard(condition: str, visible_roots: set[str]) -> list[str]:
-    if "||" in condition:
-        return []
-
-    setup: list[str] = []
-    seen: set[str] = set()
-    not_equals_by_field: dict[tuple[str, str], list[str]] = {}
-    parts = [_strip_outer_parens(p) for p in _split_conjuncts(condition)]
-
-    for part in parts:
-        m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
-        if m:
-            obj, field, rhs = m.groups()
-            if obj in visible_roots:
-                not_equals_by_field.setdefault((obj, field), []).append(rhs)
-            continue
-
-        m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
-        if m:
-            obj, field, rhs = m.groups()
-            if obj in visible_roots:
-                _append_unique(setup, f"{obj}->{field} = {_nonmatching_value(rhs)};", seen)
-            continue
-
-        m = re.fullmatch(r"!\s*([A-Za-z_]\w*)->([A-Za-z_]\w*)", part)
-        if m:
-            obj, field = m.groups()
-            if obj in visible_roots:
-                _append_unique(setup, f"{obj}->{field} = 1;", seen)
-            continue
-
-        m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", part)
-        if m:
-            obj, field = m.groups()
-            if obj in visible_roots:
-                _append_unique(setup, f"{obj}->{field} = 0;", seen)
-            continue
-
-        m = re.fullmatch(
-            r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*(<|<=|>|>=)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
-            part,
-        )
-        if m:
-            obj, field, op, rhs = m.groups()
-            if obj not in visible_roots:
-                continue
-            if op == "<":
-                value = rhs
-            elif op == "<=":
-                value = f"(({rhs}) + 1)"
-            elif op == ">":
-                value = rhs
-            else:
-                value = f"(({rhs}) > 0 ? ({rhs}) - 1 : 0)"
-            _append_unique(setup, f"{obj}->{field} = {value};", seen)
-
-    for (obj, field), values in not_equals_by_field.items():
-        _append_unique(setup, f"{obj}->{field} = {values[0]};", seen)
-
-    return setup
+    return _callee_shaper_invert_simple_return_guard(condition, visible_roots, _append_unique, _nonmatching_value)
 
 
 def _source_guard_setup_before_call(body: str, call_pos: int, visible_roots: set[str]) -> list[str]:
-    setup: list[str] = []
-    seen: set[str] = set()
-    for condition in _return_guard_conditions(body[:call_pos]):
-        for line in _invert_simple_return_guard(condition, visible_roots):
-            _append_unique(setup, line, seen)
-    return setup
+    return _callee_shaper_source_guard_setup_before_call(body, call_pos, visible_roots, _append_unique, _nonmatching_value)
 
 
 def _callee_success_candidates(
@@ -1222,72 +998,14 @@ def _callee_success_candidates(
 ) -> list[BranchCandidate]:
     if shaping_features is None:
         shaping_features = set(DEFAULT_SHAPING_FEATURES)
-    if "callee-success" not in shaping_features:
-        return []
-
-    candidates: list[BranchCandidate] = []
-    seen: set[str] = set()
-
-    def visible(expr: str) -> bool:
-        expr = expr.strip()
-        if _literal_or_macro_value(expr):
-            return True
-        m = re.match(r"([A-Za-z_]\w*)", expr)
-        return bool(m and m.group(1) in visible_roots)
-
-    patterns = [
-        re.compile(
-            r"\bint\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(([^;]*)\)\s*;\s*"
-            r"if\s*\(\s*\1\s*==\s*-1\s*\)",
-            flags=re.DOTALL,
-        ),
-        re.compile(
-            r"\bif\s*\(\s*([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*==\s*-1\s*\)",
-            flags=re.DOTALL,
-        ),
-    ]
-
-    for m in patterns[0].finditer(body):
-        _result_var, callee, args_raw = m.groups()
-        args = _split_call_args(args_raw)
-        if not all(visible(arg) for arg in args[:3]):
-            continue
-        setup, preamble = _callee_success_setup_for_call(callee, args, source_text, type_catalog)
-        if not setup:
-            continue
-        guard_setup = _source_guard_setup_before_call(body, m.start(), visible_roots)
-        name = _safe_c_name(f"source_{callee}_success")
-        if name in seen:
-            continue
-        seen.add(name)
-        candidates.append(BranchCandidate(
-            name,
-            [*guard_setup, *setup],
-            preamble,
-            witness_outputs=True,
-        ))
-
-    for m in patterns[1].finditer(body):
-        callee, args_raw = m.groups()
-        args = _split_call_args(args_raw)
-        if not all(visible(arg) for arg in args[:3]):
-            continue
-        setup, preamble = _callee_success_setup_for_call(callee, args, source_text, type_catalog)
-        if not setup:
-            continue
-        guard_setup = _source_guard_setup_before_call(body, m.start(), visible_roots)
-        name = _safe_c_name(f"source_{callee}_success")
-        if name in seen:
-            continue
-        seen.add(name)
-        candidates.append(BranchCandidate(
-            name,
-            [*guard_setup, *setup],
-            preamble,
-            witness_outputs=True,
-        ))
-
-    return candidates
+    return _callee_shaper_success_candidates(
+        body,
+        source_text,
+        type_catalog,
+        visible_roots,
+        shaping_features,
+        _callee_success_ops(),
+    )
 
 
 def _host_to_network_fn(decode_fn: str) -> str:
