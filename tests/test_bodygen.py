@@ -21,7 +21,7 @@ def _ops() -> BodyGenOps:
         extract_null_params=lambda _assumes: [],
         extract_valid_params=lambda _assumes: [],
         is_void_star=lambda p: p.raw_type.strip() == "void *",
-        pointer_argument_setup=lambda p, *_args: (
+        pointer_argument_setup=lambda p, *_args, **_kwargs: (
             [f"{p.base_type} {p.name}_obj;"],
             f"&{p.name}_obj",
             [],
@@ -31,6 +31,7 @@ def _ops() -> BodyGenOps:
         param_ref_from_arg=param_ref_from_arg,
         function_frees_param=lambda *_args: False,
         function_takes_param_ownership=lambda *_args: False,
+        function_accepts_null_param=lambda *_args: False,
         function_returns_owned_pointer=lambda _func: False,
         lookup_free_fn=lambda *_args: None,
         assumption_setup_lines=lambda *_args: [],
@@ -114,6 +115,123 @@ class BodyGenTests(unittest.TestCase):
         self.assertEqual(outputs, ["out_ret"])
         self.assertEqual(cleanup, [])
         self.assertEqual(preamble, [])
+
+    def test_failure_behavior_does_not_force_constructor_for_owned_pointer(self):
+        captured = {}
+        ops = BodyGenOps(
+            scalar_bounds={"int": (0, 10)},
+            default_shaping_features=frozenset(),
+            scalar_values_from_assumptions=lambda _assumes: {},
+            extract_result_value=lambda ensures: -1 if any("-1" in e for e in ensures) else None,
+            extract_non_null_params=lambda _assumes: [],
+            extract_nonzero_params=lambda _assumes: [],
+            extract_null_params=lambda _assumes: [],
+            extract_valid_params=lambda _assumes: [],
+            is_void_star=lambda p: False,
+            pointer_argument_setup=lambda p, *_args, **kwargs: (
+                captured.update(kwargs) or [f"{p.base_type} {p.name}_obj;"],
+                f"&{p.name}_obj",
+                [],
+            ),
+            needs_len_data_shape=lambda *_args: False,
+            append_len_data_shape=lambda _lines, _arg: None,
+            param_ref_from_arg=param_ref_from_arg,
+            function_frees_param=lambda *_args: False,
+            function_takes_param_ownership=lambda *_args: True,
+            function_accepts_null_param=lambda *_args: False,
+            function_returns_owned_pointer=lambda _func: False,
+            lookup_free_fn=lambda *_args: None,
+            assumption_setup_lines=lambda *_args: [],
+            source_for_branch_shaping=lambda source_text, _func_name: source_text or "",
+            void_param_cast_types=lambda *_args: {},
+            unique_name=lambda base, _used: base,
+            function_pointer_stub_preamble=lambda _fp_decl: [],
+            function_pointer_stub_name=lambda name: f"{name}_stub",
+            rewrite_setup_with_param_args=lambda lines, _param_args: lines,
+            safe_c_name=lambda value: value,
+        )
+        func = CFunction(
+            name="insert",
+            return_type="int",
+            return_base="int",
+            return_is_pointer=False,
+            params=[CParam("item", "Item *", "Item", True, False, False, 0)],
+        )
+        behavior = ACSLBehavior(name="full", assumes=[r"\valid(item)"], ensures=[r"\result == -1"])
+
+        gen_valid_setup_body(
+            func,
+            ["item"],
+            behavior,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            False,
+            ops,
+        )
+
+        self.assertFalse(captured["prefer_constructor"])
+
+    def test_direct_free_parameter_prefers_raw_heap(self):
+        captured = {}
+        ops = BodyGenOps(
+            scalar_bounds={"int": (0, 10)},
+            default_shaping_features=frozenset(),
+            scalar_values_from_assumptions=lambda _assumes: {},
+            extract_result_value=lambda _ensures: None,
+            extract_non_null_params=lambda _assumes: [],
+            extract_nonzero_params=lambda _assumes: [],
+            extract_null_params=lambda _assumes: [],
+            extract_valid_params=lambda _assumes: [],
+            is_void_star=lambda p: False,
+            pointer_argument_setup=lambda p, *_args, **kwargs: (
+                captured.update(kwargs) or [f"{p.base_type} *{p.name} = malloc(sizeof({p.base_type}));"],
+                p.name,
+                [],
+            ),
+            needs_len_data_shape=lambda *_args: False,
+            append_len_data_shape=lambda _lines, _arg: None,
+            param_ref_from_arg=param_ref_from_arg,
+            function_frees_param=lambda *_args: True,
+            function_takes_param_ownership=lambda *_args: False,
+            function_accepts_null_param=lambda *_args: False,
+            function_returns_owned_pointer=lambda _func: False,
+            lookup_free_fn=lambda *_args: None,
+            assumption_setup_lines=lambda *_args: [],
+            source_for_branch_shaping=lambda source_text, _func_name: source_text or "",
+            void_param_cast_types=lambda *_args: {},
+            unique_name=lambda base, _used: base,
+            function_pointer_stub_preamble=lambda _fp_decl: [],
+            function_pointer_stub_name=lambda name: f"{name}_stub",
+            rewrite_setup_with_param_args=lambda lines, _param_args: lines,
+            safe_c_name=lambda value: value,
+        )
+        func = CFunction(
+            name="consume",
+            return_type="int",
+            return_base="int",
+            return_is_pointer=False,
+            params=[CParam("item", "Item *", "Item", True, False, False, 0)],
+        )
+
+        gen_valid_setup_body(
+            func,
+            ["item"],
+            ACSLBehavior(name="valid", assumes=[r"\valid(item)"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            False,
+            ops,
+        )
+
+        self.assertTrue(captured["prefer_raw_heap"])
 
 
 if __name__ == "__main__":

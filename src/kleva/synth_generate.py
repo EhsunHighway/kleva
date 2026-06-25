@@ -86,7 +86,7 @@ def generate_yaml_from_header(
         except FileNotFoundError:
             pass
     source_text = "\n".join(visible_text_parts)
-    source_include_names = _source_include_names(src_path)
+    source_include_names = _source_include_names(src_path, include_roots)
     type_catalog = build_type_catalog(source_text)
     function_decls = _function_decl_map(source_text)
 
@@ -315,5 +315,4 @@ def generate_yaml_from_header(
                 ))
 
     return "\n".join(lines) + "\n"
-
 

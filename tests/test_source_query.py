@@ -37,11 +37,13 @@ class SourceQueryTests(unittest.TestCase):
         source = """
             void release(Node *node) { node_free(node); }
             int maybe_null(Node *node) { if (!node) return -1; return 0; }
+            int maybe_compound(Context *ctx, Node *node) { if (!ctx || !node) return -1; return 0; }
             int enqueue_item(Queue *q, Node *node) { queue_enqueue(q, node); return 0; }
         """
 
         self.assertTrue(function_frees_param(source, "release", "node"))
         self.assertTrue(function_accepts_null_param(source, "maybe_null", "node"))
+        self.assertTrue(function_accepts_null_param(source, "maybe_compound", "node"))
         self.assertTrue(function_takes_param_ownership(source, "enqueue_item", "node"))
 
     def test_detects_owned_pointer_return_by_constructor_name(self):

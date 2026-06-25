@@ -56,6 +56,19 @@ class AssumptionShapingTests(unittest.TestCase):
         self.assertIn("source_dev = packet->owner;", setup)
         self.assertIn("((Header *)packet->data)->type = 8;", setup)
 
+    def test_shapes_nested_field_relations(self):
+        params = {
+            "obj": _param("obj", "Object *", "Object"),
+        }
+
+        setup = assumption_setup_lines(
+            ["obj->state.used >= obj->state.limit"],
+            params,
+            shaping_features=set(),
+        )
+
+        self.assertIn("obj->state.used = obj->state.limit;", setup)
+
 
 if __name__ == "__main__":
     unittest.main()

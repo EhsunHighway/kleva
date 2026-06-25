@@ -23,7 +23,7 @@ class SourceDiscoveryTests(unittest.TestCase):
             main_h.write_text('#include "dep.h"\nint main_api(void);\n')
             dep_h.write_text("int dep_api(void);\n")
             dep_c.write_text('#include "dep.h"\n')
-            main_c.write_text('#include "main.h"\n#include "dep.h"\n')
+            main_c.write_text('#include "main.h"\n')
 
             visible = "\n".join(collect_visible_headers(main_h))
             self.assertIn("main_api", visible)

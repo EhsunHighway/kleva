@@ -70,8 +70,16 @@ class BufferFixtureTests(unittest.TestCase):
         append_len_data_shape(lines, "&buf")
 
         self.assertEqual(lines, [
+            "uint8_t buf_data[64];",
+            "memset(buf_data, 0, sizeof(buf_data));",
+            "if (buf->data == NULL) buf->data = buf_data;",
             "if (buf->len == 0) buf->len = 8;",
             "memset(buf->data, 0, buf->len);",
+            "uint8_t buf_data[64];",
+            "memset(buf_data, 0, sizeof(buf_data));",
+            "if (buf.data == NULL) buf.data = buf_data;",
+            "if (buf.len == 0) buf.len = 8;",
+            "memset(buf.data, 0, buf.len);",
         ])
 
 

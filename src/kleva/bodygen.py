@@ -28,6 +28,7 @@ class BodyGenOps:
     param_ref_from_arg: Callable[[str], tuple[str, str] | None]
     function_frees_param: Callable[[str | None, str, str], bool]
     function_takes_param_ownership: Callable[[str | None, str, str], bool]
+    function_accepts_null_param: Callable[[str | None, str, str], bool]
     function_returns_owned_pointer: Callable[[CFunction], bool]
     lookup_free_fn: Callable[[str, str | None], str | None]
     assumption_setup_lines: Callable[..., list[str]]
@@ -211,8 +212,26 @@ def gen_null_setup_body(
             call_args.append("NULL")
             param_args[p.name] = "NULL"
         elif p.is_pointer:
+            frees_param = ops.function_frees_param(source_text, func.name, p.name)
+            takes_ownership = ops.function_takes_param_ownership(source_text, func.name, p.name)
+            owns_or_frees_param = frees_param or takes_ownership
+            suppress_constructor_guard = (
+                frees_param and
+                ops.function_accepts_null_param(source_text, func.name, p.name)
+            )
+            prefer_raw_heap = (
+                frees_param
+            )
             setup, arg, cleanup_for_param = ops.pointer_argument_setup(
-                p, source_text, type_catalog, function_decls, func.name, used_names
+                p,
+                source_text,
+                type_catalog,
+                function_decls,
+                func.name,
+                used_names,
+                prefer_constructor=frees_param,
+                suppress_constructor_guard=suppress_constructor_guard,
+                prefer_raw_heap=prefer_raw_heap,
             )
             lines.extend(setup)
             if ops.needs_len_data_shape(func.name, p.name, source_text, type_catalog, p):
@@ -222,7 +241,7 @@ def gen_null_setup_body(
             ref = ops.param_ref_from_arg(arg)
             if ref:
                 param_refs[p.name] = ref
-            if not ops.function_frees_param(source_text, func.name, p.name) and not ops.function_takes_param_ownership(source_text, func.name, p.name):
+            if not owns_or_frees_param:
                 cleanup.extend(cleanup_for_param)
             if arg != "NULL":
                 active_params[p.name] = p
@@ -253,9 +272,10 @@ def gen_null_setup_body(
             lines.append(f"int {sentinel} = ({out_var} == {result_val}) ? 1 : 0;")
             outputs.append(sentinel)
     else:
-        lines.append(f"{func.name}({args_str});")
         out_var = "out_ok"
-        lines.append(f"int {out_var} = 1;")
+        lines.insert(0, f"int {out_var} = 1;")
+        lines.append(f"{func.name}({args_str});")
+        lines.append(f"{out_var} = 1;")
         outputs.append(out_var)
 
     return lines, outputs, cleanup, preamble
@@ -294,6 +314,7 @@ def gen_valid_setup_body(
     nonzero_params = set(ops.extract_nonzero_params(behavior.assumes))
     scalar_values = ops.scalar_values_from_assumptions(behavior.assumes)
     object_params = set(valid_params) | non_null_params
+    result_val = ops.extract_result_value(behavior.ensures)
 
     for p in func.params:
         if p.is_array:
@@ -314,8 +335,26 @@ def gen_valid_setup_body(
                 call_args.append("NULL")
                 param_args[p.name] = "NULL"
         elif p.is_pointer and p.name in valid_params:
+            frees_param = ops.function_frees_param(source_text, func.name, p.name)
+            takes_ownership = ops.function_takes_param_ownership(source_text, func.name, p.name)
+            owns_or_frees_param = frees_param or takes_ownership
+            suppress_constructor_guard = (
+                frees_param and
+                ops.function_accepts_null_param(source_text, func.name, p.name)
+            )
+            prefer_raw_heap = (
+                frees_param
+            )
             setup, arg, cleanup_for_param = ops.pointer_argument_setup(
-                p, source_text, type_catalog, function_decls, func.name, used_names
+                p,
+                source_text,
+                type_catalog,
+                function_decls,
+                func.name,
+                used_names,
+                prefer_constructor=frees_param and result_val != -1,
+                suppress_constructor_guard=suppress_constructor_guard,
+                prefer_raw_heap=prefer_raw_heap,
             )
             lines.extend(setup)
             if ops.needs_len_data_shape(func.name, p.name, source_text, type_catalog, p):
@@ -325,7 +364,7 @@ def gen_valid_setup_body(
             ref = ops.param_ref_from_arg(arg)
             if ref:
                 param_refs[p.name] = ref
-            if not ops.function_frees_param(source_text, func.name, p.name) and not ops.function_takes_param_ownership(source_text, func.name, p.name):
+            if not owns_or_frees_param:
                 cleanup.extend(cleanup_for_param)
             if arg != "NULL":
                 active_params[p.name] = p
@@ -370,7 +409,8 @@ def gen_valid_setup_body(
             )
         if not outputs:
             out_var = "out_ok"
-            lines.append(f"int {out_var} = 1;")
+            lines.insert(0, f"int {out_var} = 1;")
+            lines.append(f"{out_var} = 1;")
             outputs.append(out_var)
     elif func.return_type.strip() not in ("void", ""):
         out_var = "out_ret"
@@ -386,15 +426,15 @@ def gen_valid_setup_body(
                     cleanup.insert(0, f"if ({out_var}) {free_fn}({out_var});")
         else:
             outputs.append(out_var)
-        result_val = ops.extract_result_value(behavior.ensures)
         if result_val is not None:
             sentinel = "out_sentinel"
             lines.append(f"int {sentinel} = ({out_var} == {result_val}) ? 1 : 0;")
             outputs.append(sentinel)
     else:
-        lines.append(f"{func.name}({args_str});")
         out_var = "out_ok"
-        lines.append(f"int {out_var} = 1;")
+        lines.insert(0, f"int {out_var} = 1;")
+        lines.append(f"{func.name}({args_str});")
+        lines.append(f"{out_var} = 1;")
         outputs.append(out_var)
 
     return lines, outputs, cleanup, preamble
@@ -446,8 +486,26 @@ def gen_mixed_test(
             call_args.append("NULL")
             param_args[p.name] = "NULL"
         elif p.is_pointer:
+            frees_param = ops.function_frees_param(source_text, func.name, p.name)
+            takes_ownership = ops.function_takes_param_ownership(source_text, func.name, p.name)
+            owns_or_frees_param = frees_param or takes_ownership
+            suppress_constructor_guard = (
+                frees_param and
+                ops.function_accepts_null_param(source_text, func.name, p.name)
+            )
+            prefer_raw_heap = (
+                frees_param
+            )
             setup, arg, cleanup_for_param = ops.pointer_argument_setup(
-                p, source_text, type_catalog, function_decls, func.name, used_names
+                p,
+                source_text,
+                type_catalog,
+                function_decls,
+                func.name,
+                used_names,
+                prefer_constructor=frees_param,
+                suppress_constructor_guard=suppress_constructor_guard,
+                prefer_raw_heap=prefer_raw_heap,
             )
             lines.extend(setup)
             if ops.needs_len_data_shape(func.name, p.name, source_text, type_catalog, p):
@@ -457,7 +515,7 @@ def gen_mixed_test(
             ref = ops.param_ref_from_arg(arg)
             if ref:
                 param_refs[p.name] = ref
-            if not ops.function_frees_param(source_text, func.name, p.name) and not ops.function_takes_param_ownership(source_text, func.name, p.name):
+            if not owns_or_frees_param:
                 cleanup.extend(cleanup_for_param)
             if arg != "NULL":
                 active_params[p.name] = p
@@ -491,9 +549,10 @@ def gen_mixed_test(
         lines.append(f"{func.return_type} {out_var} = {func.name}({args_str});")
         outputs.append(out_var)
     else:
-        lines.append(f"{func.name}({args_str});")
         out_var = "out_ok"
-        lines.append(f"int {out_var} = 1;")
+        lines.insert(0, f"int {out_var} = 1;")
+        lines.append(f"{func.name}({args_str});")
+        lines.append(f"{out_var} = 1;")
         outputs.append(out_var)
 
     return lines, outputs, cleanup, preamble

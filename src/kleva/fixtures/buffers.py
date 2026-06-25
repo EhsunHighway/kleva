@@ -41,7 +41,22 @@ def needs_len_data_shape(
 
 
 def append_len_data_shape(lines: list[str], arg: str) -> None:
-    if arg == "NULL" or not re.fullmatch(r"[A-Za-z_]\w*", arg):
+    if arg == "NULL":
         return
-    lines.append(f"if ({arg}->len == 0) {arg}->len = 8;")
-    lines.append(f"memset({arg}->data, 0, {arg}->len);")
+
+    if re.fullmatch(r"[A-Za-z_]\w*", arg):
+        stem = arg
+        len_expr = f"{arg}->len"
+        data_expr = f"{arg}->data"
+    elif re.fullmatch(r"&[A-Za-z_]\w*", arg):
+        stem = arg[1:]
+        len_expr = f"{stem}.len"
+        data_expr = f"{stem}.data"
+    else:
+        return
+
+    lines.append(f"uint8_t {stem}_data[64];")
+    lines.append(f"memset({stem}_data, 0, sizeof({stem}_data));")
+    lines.append(f"if ({data_expr} == NULL) {data_expr} = {stem}_data;")
+    lines.append(f"if ({len_expr} == 0) {len_expr} = 8;")
+    lines.append(f"memset({data_expr}, 0, {len_expr});")

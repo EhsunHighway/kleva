@@ -109,6 +109,15 @@ def assumption_setup_lines(
         for part in re.split(r"\s*&&\s*", expr):
             part = part.strip()
 
+            m = re.fullmatch(r"(\w+)->([A-Za-z_]\w*(?:[.][A-Za-z_]\w*)*)\s*(==|>=|>|<=|<)\s*(\w+)->([A-Za-z_]\w*(?:[.][A-Za-z_]\w*)*)", part)
+            if m:
+                obj, lhs_suffix, op, rhs_obj, rhs_suffix = m.groups()
+                if obj in params_by_name and rhs_obj in params_by_name:
+                    rhs_expr = param_access(rhs_obj, rhs_suffix, param_refs)
+                    value = rhs_expr if op == "==" else literal_for_relation(op, rhs_expr)
+                    append_unique(lines, f"{param_access(obj, lhs_suffix, param_refs)} = {value};", seen)
+                continue
+
             m = re.fullmatch(r"(\w+)->(\w+)\s*(==|>=|>|<=|<)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
             if m:
                 obj, field, op, rhs = m.groups()
@@ -162,8 +171,13 @@ def assumption_setup_lines(
             if m:
                 obj = m.group(1)
                 if obj in params_by_name:
-                    append_unique(lines, f"if ({obj}->len == 0) {obj}->len = 1;", seen)
-                    append_unique(lines, f"memset({obj}->data, 0, {obj}->len);", seen)
+                    data_expr = param_access(obj, "data", param_refs)
+                    len_expr = param_access(obj, "len", param_refs)
+                    append_unique(lines, f"uint8_t {obj}_read_data[64];", seen)
+                    append_unique(lines, f"memset({obj}_read_data, 0, sizeof({obj}_read_data));", seen)
+                    append_unique(lines, f"if ({data_expr} == NULL) {data_expr} = {obj}_read_data;", seen)
+                    append_unique(lines, f"if ({len_expr} == 0) {len_expr} = 1;", seen)
+                    append_unique(lines, f"memset({data_expr}, 0, {len_expr});", seen)
                 continue
 
             m = re.fullmatch(

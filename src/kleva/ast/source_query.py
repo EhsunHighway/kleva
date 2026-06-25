@@ -104,11 +104,11 @@ def function_accepts_null_param(source_text: str | None, func_name: str, param_n
     if not body:
         return False
     name = re.escape(param_name)
-    if re.search(rf"\bif\s*\(\s*!\s*{name}\s*\)", body):
+    if re.search(rf"\bif\s*\([^)]*!\s*{name}[^)]*\)", body):
         return True
-    if re.search(rf"\bif\s*\(\s*{name}\s*==\s*NULL\s*\)", body):
+    if re.search(rf"\bif\s*\([^)]*{name}\s*==\s*NULL[^)]*\)", body):
         return True
-    if re.search(rf"\bif\s*\(\s*NULL\s*==\s*{name}\s*\)", body):
+    if re.search(rf"\bif\s*\([^)]*NULL\s*==\s*{name}[^)]*\)", body):
         return True
     if func_name.endswith(("_free", "_destroy")) and re.search(rf"\bif\s*\(\s*{name}\s*\)", body):
         return True

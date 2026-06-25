@@ -90,16 +90,25 @@ def collect_source_include_headers(
     return parts
 
 
-def source_include_names(source_path: str | Path) -> list[str]:
+def source_include_names(source_path: str | Path, include_dirs: list[Path] | None = None) -> list[str]:
     source = Path(source_path)
     if not source.exists():
         return []
+    include_dirs = include_dirs or []
     text = source.read_text()
     names: list[str] = []
     for m in re.finditer(r'^\s*#\s*include\s+"([^"]+)"', text, flags=re.MULTILINE):
-        name = Path(m.group(1)).name
-        if name not in names:
-            names.append(name)
+        include_name = m.group(1)
+        candidates = [source.parent / include_name]
+        candidates.extend(include_dir / include_name for include_dir in include_dirs)
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            for header_path in collect_visible_header_paths(candidate, include_dirs):
+                name = header_path.name
+                if name not in names:
+                    names.append(name)
+            break
     return names
 
 

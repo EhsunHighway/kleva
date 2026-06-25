@@ -19,6 +19,7 @@ from .ast.parser import (
 )
 from .ast.source_query import (
     function_body as _function_body,
+    function_accepts_null_param as _function_accepts_null_param,
     function_definition_body as _function_definition_body,
     function_frees_param as _function_frees_param,
     function_returns_owned_pointer as _function_returns_owned_pointer,
@@ -732,6 +733,7 @@ def _bodygen_ops() -> BodyGenOps:
         _param_ref_from_arg,
         _function_frees_param,
         _function_takes_param_ownership,
+        _function_accepts_null_param,
         _function_returns_owned_pointer,
         _lookup_free_fn,
         _assumption_setup_lines,
@@ -862,5 +864,4 @@ def _gen_mixed_test(
         shaping_features,
         _bodygen_ops(),
     )
-
 
