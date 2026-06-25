@@ -111,10 +111,11 @@ class CFunction:
 @dataclass
 class BranchCandidate:
     """A source-derived path goal that can be added to a valid fixture."""
-    name:     str
-    setup:    list[str]
-    preamble: list[str] = field(default_factory=list)
-    oracle:   bool = True
+    name:              str
+    setup:             list[str]
+    preamble:          list[str] = field(default_factory=list)
+    oracle:            bool = True
+    witness_outputs:   bool = False
 
 
 @dataclass(frozen=True)
@@ -2456,7 +2457,12 @@ def _callee_success_candidates(
         if name in seen:
             continue
         seen.add(name)
-        candidates.append(BranchCandidate(name, [*guard_setup, *setup], preamble))
+        candidates.append(BranchCandidate(
+            name,
+            [*guard_setup, *setup],
+            preamble,
+            witness_outputs=True,
+        ))
 
     for m in patterns[1].finditer(body):
         callee, args_raw = m.groups()
@@ -2471,7 +2477,12 @@ def _callee_success_candidates(
         if name in seen:
             continue
         seen.add(name)
-        candidates.append(BranchCandidate(name, [*guard_setup, *setup], preamble))
+        candidates.append(BranchCandidate(
+            name,
+            [*guard_setup, *setup],
+            preamble,
+            witness_outputs=True,
+        ))
 
     return candidates
 
@@ -2799,6 +2810,91 @@ def _append_return_field_outputs(
                 outputs.append(f"{out_name}_same")
 
 
+def _is_observable_scalar_type(type_name: str, type_catalog: CTypeCatalog | None) -> bool:
+    if type_name in _SCALAR_BOUNDS or type_name in ("uint64_t", "size_t", "EventType"):
+        return True
+    if type_catalog and type_catalog.is_complete_struct(type_name):
+        return False
+    if type_catalog and type_catalog.function_pointer(type_name):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z_]\w*", type_name))
+
+
+def _field_expr(base_expr: str, access: str, field_name: str) -> str:
+    return f"{base_expr}{access}{field_name}"
+
+
+def _append_source_witness_outputs(
+    lines: list[str],
+    outputs: list[str],
+    func: CFunction,
+    active_params: dict[str, CParam],
+    param_refs: dict[str, tuple[str, str]],
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+) -> None:
+    """
+    Add generic post-call witnesses for mutable pointer parameters.
+
+    These are intentionally structural rather than domain-specific. For a
+    source-shaped candidate, fields on complete structs are often the clearest
+    evidence that the intended side effect happened. KLEVA records shallow
+    scalar/pointer fields, plus scalar/pointer fields one nested struct deep.
+    """
+    if not type_catalog:
+        return
+
+    seen: set[str] = set(outputs)
+    for p in func.params:
+        if not p.is_pointer or p.is_const or _is_void_star(p):
+            continue
+        if p.name not in active_params or p.name not in param_refs:
+            continue
+        if _function_frees_param(source_text, func.name, p.name):
+            continue
+        if not type_catalog.is_complete_struct(p.base_type):
+            continue
+
+        base_expr, access = param_refs[p.name]
+        for field_name, field_param in type_catalog.struct_fields.get(p.base_type, {}).items():
+            out_name = _safe_c_name(f"out_{p.name}_{field_name}")
+            expr = _field_expr(base_expr, access, field_name)
+
+            if field_param.is_pointer or type_catalog.function_pointer(field_param.base_type):
+                if out_name not in seen:
+                    lines.append(f"int {out_name}_nonnull = ({expr} != NULL);")
+                    outputs.append(f"{out_name}_nonnull")
+                    seen.add(out_name)
+                continue
+
+            if _is_observable_scalar_type(field_param.base_type, type_catalog):
+                if out_name not in seen:
+                    c_type = field_param.base_type if field_param.base_type in _SCALAR_BOUNDS else "int"
+                    lines.append(f"{c_type} {out_name} = {expr};")
+                    outputs.append(out_name)
+                    seen.add(out_name)
+                continue
+
+            if "[" in field_param.raw_type or not type_catalog.is_complete_struct(field_param.base_type):
+                continue
+
+            nested_access = f"{access}{field_name}."
+            for nested_name, nested_param in type_catalog.struct_fields.get(field_param.base_type, {}).items():
+                nested_out = _safe_c_name(f"out_{p.name}_{field_name}_{nested_name}")
+                nested_expr = _field_expr(base_expr, nested_access, nested_name)
+                if nested_param.is_pointer or type_catalog.function_pointer(nested_param.base_type):
+                    if nested_out not in seen:
+                        lines.append(f"int {nested_out}_nonnull = ({nested_expr} != NULL);")
+                        outputs.append(f"{nested_out}_nonnull")
+                        seen.add(nested_out)
+                    continue
+                if _is_observable_scalar_type(nested_param.base_type, type_catalog) and nested_out not in seen:
+                    c_type = nested_param.base_type if nested_param.base_type in _SCALAR_BOUNDS else "int"
+                    lines.append(f"{c_type} {nested_out} = {nested_expr};")
+                    outputs.append(nested_out)
+                    seen.add(nested_out)
+
+
 def _gen_valid_setup_body(
     func: CFunction,
     valid_params: list[str],
@@ -2809,6 +2905,7 @@ def _gen_valid_setup_body(
     extra_setup: list[str] | None = None,
     shaping_features: set[str] | None = None,
     source_shape_oracle: bool = False,
+    source_shape_witnesses: bool = False,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     """
     Generate (body_lines, output_vars, cleanup_lines) for a valid-path test.
@@ -2894,9 +2991,20 @@ def _gen_valid_setup_body(
 
     if source_shape_oracle:
         lines.append(f"{func.name}({args_str});")
-        out_var = "out_ok"
-        lines.append(f"int {out_var} = 1;")
-        outputs.append(out_var)
+        if source_shape_witnesses:
+            _append_source_witness_outputs(
+                lines,
+                outputs,
+                func,
+                active_params,
+                param_refs,
+                source_text,
+                type_catalog,
+            )
+        if not outputs:
+            out_var = "out_ok"
+            lines.append(f"int {out_var} = 1;")
+            outputs.append(out_var)
     elif func.return_type.strip() not in ("void", ""):
         out_var = "out_ret"
         lines.append(f"{func.return_type} {out_var} = {func.name}({args_str});")
@@ -3307,6 +3415,7 @@ def generate_yaml_from_header(
                             extra_setup=candidate.setup,
                             shaping_features=shaping_features,
                             source_shape_oracle=candidate.oracle,
+                            source_shape_witnesses=candidate.witness_outputs,
                         )
                         preamble = [*preamble, *candidate.preamble]
                         lines.extend(_emit_yaml_function(
