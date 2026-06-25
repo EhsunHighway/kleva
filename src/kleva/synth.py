@@ -58,6 +58,11 @@ from .bodygen import (
     param_ref_from_arg as _bodygen_param_ref_from_arg,
 )
 from .config import resolve_klee_clang, resolve_klee_include, resolve_llvm_link
+from .fixtures.buffers import (
+    append_len_data_shape as _buffer_fixture_append_len_data_shape,
+    needs_len_data_shape as _buffer_fixture_needs_len_data_shape,
+    struct_has_fields as _buffer_fixture_struct_has_fields,
+)
 from .fixtures.construction import (
     default_return_value as _default_return_value,
     default_scalar_value as _default_scalar_value,
@@ -211,10 +216,7 @@ def normalize_shaping_features(
 
 
 def _struct_has_fields(type_catalog: CTypeCatalog | None, type_name: str, fields: set[str]) -> bool:
-    if not type_catalog:
-        return False
-    available = set(type_catalog.struct_fields.get(type_name, {}))
-    return fields.issubset(available)
+    return _buffer_fixture_struct_has_fields(type_catalog, type_name, fields)
 
 
 def _needs_len_data_shape(
@@ -224,31 +226,18 @@ def _needs_len_data_shape(
     type_catalog: CTypeCatalog | None,
     param: CParam,
 ) -> bool:
-    """
-    Some C APIs use a pointer to a buffer object whose real payload extent is
-    stored in `len` while bytes live at `data`. Constructors often allocate
-    capacity but leave len at zero. If the target path reads that length or
-    passes the object to a clone/copy helper, give synth a concrete payload.
-    """
-    if not _struct_has_fields(type_catalog, param.base_type, {"len", "data"}):
-        return False
-
-    body = _source_for_branch_shaping(source_text, func_name)
-    if not body:
-        return False
-
-    if re.search(rf"\b{re.escape(param_name)}->len\b", body):
-        return True
-    if re.search(rf"\b\w*(?:clone|copy|send|transmit|write)\w*\s*\([^;]*\b{re.escape(param_name)}\b", body):
-        return True
-    return False
+    return _buffer_fixture_needs_len_data_shape(
+        func_name,
+        param_name,
+        source_text,
+        type_catalog,
+        param,
+        _source_for_branch_shaping,
+    )
 
 
 def _append_len_data_shape(lines: list[str], arg: str) -> None:
-    if arg == "NULL" or not re.fullmatch(r"[A-Za-z_]\w*", arg):
-        return
-    lines.append(f"if ({arg}->len == 0) {arg}->len = 8;")
-    lines.append(f"memset({arg}->data, 0, {arg}->len);")
+    _buffer_fixture_append_len_data_shape(lines, arg)
 
 
 def _is_literal_or_macro(value: str) -> bool:
