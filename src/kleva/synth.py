@@ -138,6 +138,10 @@ from .shaping.switches import (
     state_switch_candidates as _switch_shaper_state_switch_candidates,
     switch_case_blocks as _switch_shaper_case_blocks,
 )
+from .shaping.tables import (
+    TableShapeOps,
+    loop_table_candidates as _table_shaper_loop_table_candidates,
+)
 from .yaml_emit import emit_yaml_function as _emit_yaml_function
 
 
@@ -418,86 +422,25 @@ def _loop_table_candidates(
     type_catalog: CTypeCatalog | None,
     shaping_features: set[str] | None = None,
 ) -> list[BranchCandidate]:
-    if not type_catalog:
-        return []
     if shaping_features is None:
         shaping_features = set(DEFAULT_SHAPING_FEATURES)
-    if "loop-tables" not in shaping_features:
-        return []
-
-    candidates: list[BranchCandidate] = []
-    good_setup = _good_path_setup_from_source(body, aliases, decoded_aliases, direct_aliases, derived_aliases)
-
-    for alias, (cast_type, expr) in aliases.items():
-        pattern = (
-            rf"{re.escape(alias)}->(\w+)->(\w+)\s*\[\s*(\w+)\s*\]\.(\w+)\s*==\s*([A-Za-z_]\w*|\d+)"
-            rf"\s*&&\s*{re.escape(alias)}->\1->\2\s*\[\s*\3\s*\]\.(\w+)\s*==\s*(\w+)"
-        )
-        for m in re.finditer(pattern, body):
-            container_field, array_field, _idx, match_field_a, match_value_a, match_field_b, match_value_b = m.groups()
-            container_param = type_catalog.field_type(cast_type, container_field)
-            if not container_param:
-                continue
-            container_type = container_param.base_type
-            array_param = type_catalog.field_type(container_type, array_field)
-            if not array_param:
-                continue
-            element_type = array_param.base_type
-            element_fields = type_catalog.struct_fields.get(element_type, {})
-
-            preamble: list[str] = []
-            setup = list(good_setup)
-            state_var = _safe_c_name(f"kleva_{alias}_{container_field}")
-            setup.extend([
-                f"{container_type} {state_var};",
-                f"memset(&{state_var}, 0, sizeof({state_var}));",
-                f"(({cast_type} *){expr})->{container_field} = &{state_var};",
-            ])
-
-            decoded_match = decoded_aliases.get(match_value_b)
-            if decoded_match:
-                decode_fn, decoded_alias, decoded_field = decoded_match
-                if decoded_alias in aliases:
-                    decoded_cast, decoded_expr = aliases[decoded_alias]
-                    encode_fn = _host_to_network_fn(decode_fn)
-                    if encode_fn:
-                        setup.append(f"{_cast_field_expr(decoded_cast, decoded_expr, decoded_field)} = {encode_fn}(1);")
-                        match_value_b = "1"
-
-            setup.extend([
-                f"(({cast_type} *){expr})->{container_field}->{array_field}[0].{match_field_a} = {match_value_a};",
-                f"(({cast_type} *){expr})->{container_field}->{array_field}[0].{match_field_b} = {match_value_b};",
-            ])
-
-            for field_name, field_param in element_fields.items():
-                fp_decl = type_catalog.function_pointer(field_param.base_type)
-                if fp_decl and "function-pointers" in shaping_features:
-                    preamble.extend(_function_pointer_stub_preamble(fp_decl))
-                    setup.append(
-                        f"(({cast_type} *){expr})->{container_field}->{array_field}[0].{field_name} = "
-                        f"{_function_pointer_stub_name(fp_decl.name)};"
-                    )
-
-            candidates.append(BranchCandidate(
-                _safe_c_name(f"source_{alias}_{array_field}_match"),
-                setup,
-                preamble,
-            ))
-
-            miss_setup = list(good_setup)
-            miss_setup.extend([
-                f"{container_type} {state_var};",
-                f"memset(&{state_var}, 0, sizeof({state_var}));",
-                f"(({cast_type} *){expr})->{container_field} = &{state_var};",
-                f"(({cast_type} *){expr})->{container_field}->{array_field}[0].{match_field_a} = 0;",
-            ])
-            candidates.append(BranchCandidate(
-                _safe_c_name(f"source_{alias}_{array_field}_miss"),
-                miss_setup,
-                [],
-            ))
-
-    return candidates
+    return _table_shaper_loop_table_candidates(
+        body,
+        aliases,
+        decoded_aliases,
+        direct_aliases,
+        derived_aliases,
+        type_catalog,
+        shaping_features,
+        TableShapeOps(
+            _good_path_setup_from_source,
+            _host_to_network_fn,
+            _cast_field_expr,
+            _function_pointer_stub_preamble,
+            _function_pointer_stub_name,
+            _safe_c_name,
+        ),
+    )
 
 
 def _infer_lookup_shape(
@@ -528,25 +471,6 @@ def _infer_lookup_shape_for_call(
         type_catalog,
         LookupInferOps(_function_decl_map, _function_body, _split_call_args),
     )
-
-
-def _setup_decoded_local(
-    local: str,
-    value: str,
-    aliases: dict[str, tuple[str, str]],
-    decoded_aliases: dict[str, tuple[str, str, str]],
-) -> list[str]:
-    decoded = decoded_aliases.get(local)
-    if not decoded:
-        return []
-    decode_fn, alias, field = decoded
-    if alias not in aliases:
-        return []
-    encode_fn = _host_to_network_fn(decode_fn)
-    if not encode_fn:
-        return []
-    cast_type, expr = aliases[alias]
-    return [f"{_cast_field_expr(cast_type, expr, field)} = {encode_fn}({value});"]
 
 
 def _split_conjuncts(expr: str) -> list[str]:
