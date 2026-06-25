@@ -107,13 +107,16 @@ from .shaping.conditions import (
 )
 from .shaping.lookups import (
     FallbackLookupOps,
+    LookupFixtureOps,
     LookupInferOps,
     LookupSetupOps,
     LookupShape,
+    alias_pointer_guard_setup as _lookup_shaper_alias_pointer_guard_setup,
     fallback_lookup_candidates as _lookup_shaper_fallback_lookup_candidates,
     infer_lookup_shape as _lookup_shaper_infer_lookup_shape,
     infer_lookup_shape_for_call as _lookup_shaper_infer_lookup_shape_for_call,
     lookup_condition_setup as _lookup_shaper_condition_setup,
+    lookup_container_setup as _lookup_shaper_container_setup,
     lookup_miss_setup as _lookup_shaper_miss_setup,
 )
 from .shaping.source_aliases import (
@@ -566,31 +569,22 @@ def _switch_case_blocks(body: str, switch_start: int) -> list[tuple[str, str]]:
     return _switch_shaper_case_blocks(body, switch_start)
 
 
+def _lookup_fixture_ops() -> LookupFixtureOps:
+    return LookupFixtureOps(
+        _expand_alias_expr,
+        _cast_alias_backing_setup,
+        _cast_field_expr,
+        _append_unique,
+        _safe_c_name,
+    )
+
+
 def _lookup_container_setup(
     shape: LookupShape,
     aliases: dict[str, tuple[str, str]],
     type_catalog: CTypeCatalog,
 ) -> list[str]:
-    raw_expr = shape.container_expr.strip()
-    expr = _expand_alias_expr(raw_expr, aliases)
-    storage = _safe_c_name(f"kleva_{shape.result_var}_{shape.array_field}_owner")
-    setup = [
-        f"{shape.container_type} {storage};",
-        f"memset(&{storage}, 0, sizeof({storage}));",
-    ]
-
-    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", raw_expr)
-    if m and m.group(1) in aliases:
-        alias, field = m.groups()
-        cast_type, cast_expr = aliases[alias]
-        backing = _cast_alias_backing_setup(alias, cast_type, cast_expr, {})
-        setup.extend(backing)
-        setup.append(f"{_cast_field_expr(cast_type, cast_expr, field)} = &{storage};")
-        return setup
-
-    if re.fullmatch(r"[A-Za-z_]\w*", expr):
-        setup.append(f"{expr} = &{storage};")
-    return setup
+    return _lookup_shaper_container_setup(shape, aliases, type_catalog, _lookup_fixture_ops())
 
 
 def _alias_pointer_guard_setup(
@@ -599,30 +593,13 @@ def _alias_pointer_guard_setup(
     type_catalog: CTypeCatalog,
     skip_exprs: set[str] | None = None,
 ) -> list[str]:
-    setup: list[str] = []
-    seen: set[str] = set()
-    skip_exprs = skip_exprs or set()
-
-    for alias, (cast_type, cast_expr) in aliases.items():
-        for field in re.findall(rf"!\s*{re.escape(alias)}->(\w+)", body):
-            raw_expr = f"{alias}->{field}"
-            if raw_expr in skip_exprs:
-                continue
-
-            field_param = type_catalog.field_type(cast_type, field)
-            if not field_param or not field_param.is_pointer:
-                continue
-
-            target = _cast_field_expr(cast_type, cast_expr, field)
-            if type_catalog.is_complete_struct(field_param.base_type):
-                storage = _safe_c_name(f"kleva_{alias}_{field}_guard")
-                _append_unique(setup, f"{field_param.base_type} {storage};", seen)
-                _append_unique(setup, f"memset(&{storage}, 0, sizeof({storage}));", seen)
-                _append_unique(setup, f"{target} = &{storage};", seen)
-            else:
-                _append_unique(setup, f"{target} = ({field_param.base_type} *)1;", seen)
-
-    return setup
+    return _lookup_shaper_alias_pointer_guard_setup(
+        body,
+        aliases,
+        type_catalog,
+        skip_exprs,
+        _lookup_fixture_ops(),
+    )
 
 
 def _lookup_condition_setup(

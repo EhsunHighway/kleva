@@ -3,10 +3,14 @@ import unittest
 from kleva.ast.model import CFunction, CParam, CTypeCatalog
 from kleva.shaping.lookups import (
     FallbackLookupOps,
+    LookupFixtureOps,
     LookupInferOps,
     LookupSetupOps,
+    LookupShape,
+    alias_pointer_guard_setup,
     infer_lookup_shape,
     lookup_condition_setup,
+    lookup_container_setup,
     fallback_lookup_candidates,
 )
 
@@ -153,6 +157,83 @@ class LookupShapingTests(unittest.TestCase):
         self.assertEqual(candidates[0].name, "source_fallback_lookup_hit")
         self.assertIn("allow_fallback = 1;", candidates[0].setup)
         self.assertIn("db->items[0].id = 0;", candidates[0].setup)
+
+    def test_lookup_container_setup_builds_owner_for_plain_container_expr(self):
+        shape = LookupShape(
+            callee="find_record",
+            result_var="rec",
+            element_type="Record",
+            element_alias="slot",
+            container_type="Table",
+            container_expr="db",
+            array_field="items",
+            param_args={},
+            conditions=[],
+        )
+        ops = LookupFixtureOps(
+            lambda expr, _aliases: expr,
+            lambda *_args: [],
+            lambda cast_type, expr, field: f"(({cast_type} *){expr})->{field}",
+            _append_unique,
+            lambda value: value,
+        )
+
+        self.assertEqual(
+            lookup_container_setup(shape, {}, CTypeCatalog(), ops),
+            [
+                "Table kleva_rec_items_owner;",
+                "memset(&kleva_rec_items_owner, 0, sizeof(kleva_rec_items_owner));",
+                "db = &kleva_rec_items_owner;",
+            ],
+        )
+
+    def test_lookup_container_and_pointer_guard_shape_casted_owner_fields(self):
+        catalog = CTypeCatalog(
+            complete_structs={"Context", "Table"},
+            struct_fields={
+                "Context": {
+                    "table": _param("table", "Table *", "Table", True),
+                    "opaque": _param("opaque", "Opaque *", "Opaque", True),
+                },
+            },
+        )
+        shape = LookupShape(
+            callee="find_record",
+            result_var="rec",
+            element_type="Record",
+            element_alias="slot",
+            container_type="Table",
+            container_expr="ctx->table",
+            array_field="items",
+            param_args={},
+            conditions=[],
+        )
+        ops = LookupFixtureOps(
+            lambda expr, aliases: expr.replace("ctx", "((Context *)raw)") if aliases else expr,
+            lambda alias, cast_type, expr, _params: [
+                f"{cast_type} backing;",
+                f"{alias} uses {expr};",
+            ],
+            lambda cast_type, expr, field: f"(({cast_type} *){expr})->{field}",
+            _append_unique,
+            lambda value: value,
+        )
+
+        aliases = {"ctx": ("Context", "raw")}
+        self.assertEqual(
+            lookup_container_setup(shape, aliases, catalog, ops),
+            [
+                "Table kleva_rec_items_owner;",
+                "memset(&kleva_rec_items_owner, 0, sizeof(kleva_rec_items_owner));",
+                "Context backing;",
+                "ctx uses raw;",
+                "((Context *)raw)->table = &kleva_rec_items_owner;",
+            ],
+        )
+        self.assertEqual(
+            alias_pointer_guard_setup("if (!ctx->table && !ctx->opaque) return -1;", aliases, catalog, {"ctx->table"}, ops),
+            ["((Context *)raw)->opaque = (Opaque *)1;"],
+        )
 
 
 if __name__ == "__main__":

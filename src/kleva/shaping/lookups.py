@@ -40,6 +40,15 @@ class LookupSetupOps:
 
 
 @dataclass(frozen=True)
+class LookupFixtureOps:
+    expand_alias_expr:        Callable[[str, dict[str, tuple[str, str]]], str]
+    cast_alias_backing_setup: Callable[[str, str, str, dict], list[str]]
+    cast_field_expr:          Callable[[str, str, str], str]
+    append_unique:            Callable[[list[str], str, set[str]], None]
+    safe_c_name:              Callable[[str], str]
+
+
+@dataclass(frozen=True)
 class FallbackLookupOps:
     strip_comments:                Callable[[str], str]
     good_path_setup_from_source:    Callable[..., list[str]]
@@ -223,6 +232,67 @@ def lookup_miss_setup(
             else:
                 ops.append_unique(setup, f"{elem}.{field} = {ops.nonmatching_value(rhs)};", seen)
             return setup
+
+    return setup
+
+
+def lookup_container_setup(
+    shape: LookupShape,
+    aliases: dict[str, tuple[str, str]],
+    type_catalog: CTypeCatalog,
+    ops: LookupFixtureOps,
+) -> list[str]:
+    raw_expr = shape.container_expr.strip()
+    expr = ops.expand_alias_expr(raw_expr, aliases)
+    storage = ops.safe_c_name(f"kleva_{shape.result_var}_{shape.array_field}_owner")
+    setup = [
+        f"{shape.container_type} {storage};",
+        f"memset(&{storage}, 0, sizeof({storage}));",
+    ]
+
+    m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)", raw_expr)
+    if m and m.group(1) in aliases:
+        alias, field = m.groups()
+        cast_type, cast_expr = aliases[alias]
+        backing = ops.cast_alias_backing_setup(alias, cast_type, cast_expr, {})
+        setup.extend(backing)
+        setup.append(f"{ops.cast_field_expr(cast_type, cast_expr, field)} = &{storage};")
+        return setup
+
+    if re.fullmatch(r"[A-Za-z_]\w*", expr):
+        setup.append(f"{expr} = &{storage};")
+    return setup
+
+
+def alias_pointer_guard_setup(
+    body: str,
+    aliases: dict[str, tuple[str, str]],
+    type_catalog: CTypeCatalog,
+    skip_exprs: set[str] | None,
+    ops: LookupFixtureOps,
+) -> list[str]:
+    setup: list[str] = []
+    seen: set[str] = set()
+    skip_exprs = skip_exprs or set()
+
+    for alias, (cast_type, cast_expr) in aliases.items():
+        for field in re.findall(rf"!\s*{re.escape(alias)}->(\w+)", body):
+            raw_expr = f"{alias}->{field}"
+            if raw_expr in skip_exprs:
+                continue
+
+            field_param = type_catalog.field_type(cast_type, field)
+            if not field_param or not field_param.is_pointer:
+                continue
+
+            target = ops.cast_field_expr(cast_type, cast_expr, field)
+            if type_catalog.is_complete_struct(field_param.base_type):
+                storage = ops.safe_c_name(f"kleva_{alias}_{field}_guard")
+                ops.append_unique(setup, f"{field_param.base_type} {storage};", seen)
+                ops.append_unique(setup, f"memset(&{storage}, 0, sizeof({storage}));", seen)
+                ops.append_unique(setup, f"{target} = &{storage};", seen)
+            else:
+                ops.append_unique(setup, f"{target} = ({field_param.base_type} *)1;", seen)
 
     return setup
 
