@@ -38,12 +38,16 @@ bounds (preferred over skip_if)
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Optional
 
 from .config import FunctionSpec, InputSpec
 from .ktest import KTestObject, find_obj, parse_ktest
 from .recipe import Recipe
+
+MAX_SCALAR_SWEEP_VALUES = 256
+DEFAULT_UNBOUNDED_SCALAR_SWEEP = tuple(range(0, 22))
 
 
 # ── skip condition evaluator ──────────────────────────────────────────────────
@@ -84,6 +88,7 @@ def build_recipe(
     ktest_objs: list[KTestObject],
     idx:        int,
     ktest_path:  str | None = None,
+    scalar_overrides: dict[str, int] | None = None,
 ) -> Optional[Recipe]:
     """
     Produce one Recipe from a FunctionSpec + the ktest objects for one test vector.
@@ -95,12 +100,16 @@ def build_recipe(
     fn_id     = f"{fn_suffix}_tv{idx:03d}"
 
     # Collect scalars first; array length_from references need them.
+    scalar_overrides = scalar_overrides or {}
     scalars: dict[str, int] = {}
     for inp in spec.inputs:
         if not inp.c_type.endswith("[]"):
-            obj = find_obj(ktest_objs, inp.ktest_name)
-            if obj:
-                scalars[inp.ktest_name] = obj.uint
+            if inp.ktest_name in scalar_overrides:
+                scalars[inp.ktest_name] = scalar_overrides[inp.ktest_name]
+            else:
+                obj = find_obj(ktest_objs, inp.ktest_name)
+                if obj:
+                    scalars[inp.ktest_name] = obj.uint
 
     # Build declarations, honouring skip_if.
     decl_lines: list[str] = []
@@ -122,7 +131,7 @@ def build_recipe(
             decl_lines.append(_array_decl(inp, obj.data, n))
 
         else:
-            val = obj.uint
+            val = scalar_overrides.get(inp.ktest_name, obj.uint)
             if _should_skip(inp, val):
                 return None
             decl_lines.append(_scalar_decl(inp, val))
@@ -141,6 +150,46 @@ def build_recipe(
         candidate_origin = spec.candidate_origin,
         candidate_facts = spec.candidate_facts,
     )
+
+
+def scalar_sweep_values(spec: FunctionSpec, ktest_objs: list[KTestObject]) -> list[dict[str, int]]:
+    """
+    Return small, generic scalar override sets for recipe expansion.
+
+    KLEE emits path representatives, not necessarily every useful concrete
+    scalar. For small finite scalar spaces, KLEVA can cheaply expand recipes
+    before EVA so generated unit tests preserve value-level regression
+    coverage. The rule is type/name agnostic:
+
+      - bounded scalar inputs with span <= MAX_SCALAR_SWEEP_VALUES are fully
+        enumerated;
+      - a function with one unbounded scalar input gets a small default sweep;
+      - larger or multi-scalar spaces are left to KLEE path representatives.
+    """
+    scalar_inputs = [inp for inp in spec.inputs if not inp.c_type.endswith("[]")]
+    bounded: list[tuple[InputSpec, list[int]]] = []
+    for inp in scalar_inputs:
+        if inp.bounds is None or inp.bounds.min is None or inp.bounds.max is None:
+            continue
+        lo, hi = inp.bounds.min, inp.bounds.max
+        if hi < lo:
+            continue
+        span = hi - lo + 1
+        if span <= MAX_SCALAR_SWEEP_VALUES:
+            bounded.append((inp, list(range(lo, hi + 1))))
+
+    if len(bounded) == 1:
+        inp, values = bounded[0]
+        return [{inp.ktest_name: value} for value in values]
+
+    if len(scalar_inputs) == 1:
+        inp = scalar_inputs[0]
+        if inp.bounds is None:
+            if find_obj(ktest_objs, inp.ktest_name) is None:
+                return []
+            return [{inp.ktest_name: value} for value in DEFAULT_UNBOUNDED_SCALAR_SWEEP]
+
+    return []
 
 
 # ── collect all recipes for one function ─────────────────────────────────────
@@ -162,15 +211,34 @@ def build_recipes_for_function(
         return []
 
     recipes: list[Recipe] = []
-    for i, kf in enumerate(sorted(ktest_path.glob("*.ktest")), 1):
+    seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+
+    def append_unique(recipe: Recipe | None) -> None:
+        if recipe is None:
+            return
+        key = (tuple(recipe.decl_lines), tuple(recipe.body_lines))
+        if key in seen:
+            return
+        recipe.fn_id = _renumber_fn_id(recipe.fn_id, len(recipes) + 1)
+        seen.add(key)
+        recipes.append(recipe)
+
+    for _i, kf in enumerate(sorted(ktest_path.glob("*.ktest")), 1):
         try:
             objs = parse_ktest(ktest_tool, str(kf))
         except Exception as exc:
             import sys
             print(f"    [warn] {kf.name}: {exc}", file=sys.stderr)
             continue
-        r = build_recipe(spec, objs, i, str(kf))
-        if r:
-            recipes.append(r)
+        expansions = scalar_sweep_values(spec, objs)
+        if expansions:
+            for overrides in expansions:
+                append_unique(build_recipe(spec, objs, len(recipes) + 1, str(kf), overrides))
+        else:
+            append_unique(build_recipe(spec, objs, len(recipes) + 1, str(kf)))
 
     return recipes
+
+
+def _renumber_fn_id(fn_id: str, idx: int) -> str:
+    return re.sub(r"_tv\d+$", f"_tv{idx:03d}", fn_id)

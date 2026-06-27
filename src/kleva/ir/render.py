@@ -19,21 +19,18 @@ def assignable_expr(expr: Expr) -> str | None:
     if isinstance(expr, VarRef):
         return expr.name
     if isinstance(expr, CastExpr):
-        inner = assignable_expr(expr.expr) or value_expr(expr.expr)
-        if inner is None or not expr.target_type:
-            return None
-        return f"(({expr.target_type}){inner})"
+        return None
     if isinstance(expr, Dereference):
-        inner = assignable_expr(expr.operand)
+        inner = assignable_expr(expr.operand) or value_expr(expr.operand)
         if inner:
             return f"*{inner}"
     if isinstance(expr, FieldAccess):
-        base = assignable_expr(expr.base)
+        base = assignable_expr(expr.base) or value_expr(expr.base)
         if base is None:
             return None
         return f"{base}{_field_operator(expr.base)}{expr.field}"
     if isinstance(expr, ArraySubscript):
-        base = assignable_expr(expr.base)
+        base = assignable_expr(expr.base) or value_expr(expr.base)
         index = value_expr(expr.index)
         if base is None or index is None:
             return None

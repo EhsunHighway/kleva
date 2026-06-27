@@ -46,6 +46,21 @@ class IrRenderTests(unittest.TestCase):
         )
         self.assertEqual(assignable_expr(Dereference(VarRef("ptr"))), "*ptr")
 
+    def test_casted_computed_value_is_not_assignable(self):
+        expr = CastExpr(
+            "size_t",
+            BinaryOp(
+                "-",
+                FieldAccess(VarRef("p", "Packet *"), "data", "uint8_t *"),
+                FieldAccess(VarRef("p", "Packet *"), "head", "uint8_t *"),
+                "long",
+            ),
+            c_type="size_t",
+        )
+
+        self.assertIsNone(assignable_expr(expr))
+        self.assertEqual(value_expr(expr), "((size_t)(p->data - p->head))")
+
     def test_renders_value_forms(self):
         self.assertEqual(value_expr(IntLiteral(7)), "7")
         self.assertEqual(value_expr(AddressOf(FieldAccess(VarRef("ctx"), "slot"))), "&ctx->slot")

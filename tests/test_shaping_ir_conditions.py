@@ -105,6 +105,34 @@ class IrConditionShapingTests(unittest.TestCase):
             ObjectPathFact("ctx", ("state",), "Context *", "int"),
         ])
 
+    def test_skips_casted_pointer_difference_condition(self):
+        condition = BinaryOp(
+            "<",
+            CastExpr(
+                "size_t",
+                BinaryOp(
+                    "-",
+                    FieldAccess(VarRef("p", "Packet *"), "data", "uint8_t *"),
+                    FieldAccess(VarRef("p", "Packet *"), "head", "uint8_t *"),
+                    "long",
+                ),
+                c_type="size_t",
+            ),
+            VarRef("header_len", "size_t"),
+            "int",
+        )
+        func = FunctionIR("packet_prepend", [IfStmt(condition)])
+
+        candidates = condition_candidates_from_ir(func, _ops())
+
+        self.assertEqual(
+            [(candidate.name, candidate.setup) for candidate in candidates],
+            [
+                ("ir_if_0_header_len_gt_size_t_p_data_p_head", ["header_len = ((((size_t)(p->data - p->head))) + 1);"]),
+                ("ir_if_0_false_header_len_le_size_t_p_data_p_head", ["header_len = ((size_t)(p->data - p->head));"]),
+            ],
+        )
+
     def test_skips_unreachable_local_variable_condition(self):
         func = FunctionIR(
             "make",
