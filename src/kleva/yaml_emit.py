@@ -26,6 +26,22 @@ def emit_output_list(outputs: list[str], indent_n: int = 6) -> str:
     return "[" + ", ".join(outputs) + "]"
 
 
+def emit_fact_list(facts: list[dict[str, str]], indent_n: int = 6) -> str:
+    pad = " " * indent_n
+    child_pad = " " * (indent_n + 2)
+    if not facts:
+        return "[]"
+    result = "\n"
+    for fact in facts:
+        result += f"{pad}- kind: {fact['kind']}\n"
+        for key, value in fact.items():
+            if key == "kind":
+                continue
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            result += f'{child_pad}{key}: "{escaped}"\n'
+    return result.rstrip("\n")
+
+
 def emit_yaml_function(
     func: CFunction,
     behavior: ACSLBehavior,
@@ -36,6 +52,10 @@ def emit_yaml_function(
     preamble: list[str] | None = None,
     source_include_names: list[str] | None = None,
     candidate: bool = False,
+    source_location: str | None = None,
+    target_branch:   str | None = None,
+    candidate_origin: str | None = None,
+    candidate_facts: list[dict[str, str]] | None = None,
 ) -> list[str]:
     """Emit YAML lines for one function test entry."""
     preamble = preamble or []
@@ -67,4 +87,15 @@ def emit_yaml_function(
         lines.append("    cleanup:   []")
     if candidate:
         lines.append("    candidate: true")
+    if source_location:
+        escaped = source_location.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'    source_location: "{escaped}"')
+    if target_branch:
+        escaped = target_branch.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'    target_branch: "{escaped}"')
+    if candidate_origin:
+        escaped = candidate_origin.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'    candidate_origin: "{escaped}"')
+    if candidate_facts:
+        lines.append(f"    candidate_facts: {emit_fact_list(candidate_facts)}")
     return lines

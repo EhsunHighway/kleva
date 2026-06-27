@@ -83,6 +83,7 @@ def build_recipe(
     spec:       FunctionSpec,
     ktest_objs: list[KTestObject],
     idx:        int,
+    ktest_path:  str | None = None,
 ) -> Optional[Recipe]:
     """
     Produce one Recipe from a FunctionSpec + the ktest objects for one test vector.
@@ -134,6 +135,11 @@ def build_recipe(
         outputs    = spec.outputs,
         preamble   = spec.preamble,
         candidate  = spec.candidate,
+        ktest_path = ktest_path,
+        source_location = spec.source_location,
+        target_branch   = spec.target_branch,
+        candidate_origin = spec.candidate_origin,
+        candidate_facts = spec.candidate_facts,
     )
 
 
@@ -163,7 +169,7 @@ def build_recipes_for_function(
             import sys
             print(f"    [warn] {kf.name}: {exc}", file=sys.stderr)
             continue
-        r = build_recipe(spec, objs, i)
+        r = build_recipe(spec, objs, i, str(kf))
         if r:
             recipes.append(r)
 

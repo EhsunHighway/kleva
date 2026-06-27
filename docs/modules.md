@@ -84,6 +84,17 @@ The config model is the shared API between YAML mode and no-YAML mode. `kleva
 run` generates YAML text internally, parses it with `load_config_text`, and then
 uses the same `ModuleConfig` path as YAML mode.
 
+Candidate entries may carry source metadata:
+
+- `source_location`
+- `target_branch`
+- `candidate_origin`
+- `candidate_facts`
+
+`candidate_facts` is a machine-readable explanation of the candidate goal, for
+example a branch fact such as `ctx->state case 1` or a call outcome such as
+`prepare equals_-1 success`.
+
 Touch this module when changing the test-plan schema.
 
 ## `acsl.py`
@@ -103,13 +114,19 @@ Important dataclasses:
 
 - `ACSLBehavior`
 - `ACSLSpec`
+- `AcslParser`
+- `ScannerAcslParser`
+- `RegexAcslParser` compatibility alias
 
 Important function:
 
 - `parse_acsl(header_path)`
 
 This module intentionally extracts a practical subset of ACSL rather than
-implementing the whole ACSL language.
+implementing the whole ACSL language. The current parser is scanner-backed and
+is isolated behind `AcslParser` / `ScannerAcslParser`. Synthesis accepts an
+`AcslParser`, so a future fuller ACSL parser can replace the scanner without
+changing the test-plan generator.
 
 Touch this module when KLEVA needs to understand more contract syntax.
 
@@ -142,7 +159,8 @@ Main concepts:
 - Casted-struct field shaping.
 - Byte-order-aware assignments.
 - Loop/table match and miss candidates.
-- Source-shaped branch candidates.
+- AST/IR-shaped branch candidates.
+- Optional regex fallback branch candidates for compatibility.
 
 Shaping features are controlled by:
 
@@ -150,6 +168,30 @@ Shaping features are controlled by:
 - `--no-shaping`
 
 Touch this module when improving automatic test-plan generation.
+
+## `compat/source_fallbacks.py`
+
+Explicit compatibility boundary for older source-text helpers.
+
+The default synthesis path should prefer:
+
+- Clang header declarations.
+- Clang-derived type/function metadata.
+- Typed implementation IR.
+- `ScannerAcslParser` for ACSL comments.
+
+`compat/source_fallbacks.py` wraps the older source-text parsers and scanners
+with names such as `fallback_parse_header`, `fallback_function_body`, and
+`fallback_build_type_catalog`. Use these only when IR is disabled, IR extraction
+fails, or `regex-fallbacks` is explicitly requested.
+
+Generated YAML reports fallback use in the header:
+
+- `# Fallbacks: none`
+- `# Fallbacks: used`
+
+When fallback is used, `kleva synth` prints a warning and `--ir-diagnostics`
+records `source-fallback` entries.
 
 ## `augment.py`
 
@@ -260,6 +302,7 @@ Responsibilities:
 - Apply `skip_if`.
 - Build array declarations.
 - Produce one recipe per accepted KLEE test vector.
+- Preserve candidate metadata and semantic facts for diagnostics.
 
 Important function:
 
@@ -274,6 +317,9 @@ Recipe data model and guard expansion.
 Important dataclass:
 
 - `Recipe`
+
+Recipes preserve candidate source metadata and semantic facts so generated
+unit-test diagnostics can explain why an optional candidate was created.
 
 Important helper:
 
@@ -447,4 +493,3 @@ Change the test-plan schema:
 
 - `config.py`
 - all producers/consumers of affected fields
-

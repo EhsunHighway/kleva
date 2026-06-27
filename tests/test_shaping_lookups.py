@@ -1,6 +1,7 @@
 import unittest
 
 from kleva.ast.model import CFunction, CParam, CTypeCatalog
+from kleva.shaping.candidates import BranchFact
 from kleva.shaping.lookups import (
     FallbackLookupOps,
     LookupFixtureOps,
@@ -131,6 +132,7 @@ class LookupShapingTests(unittest.TestCase):
         infer_ops = LookupInferOps(decls, function_body, lambda raw: [p.strip() for p in raw.split(",")])
         fallback_ops = FallbackLookupOps(
             lambda text: text,
+            lambda expr, _aliases: expr,
             lambda *_args: [],
             lambda *_args: [],
             lambda *_args: ["allow_fallback = 1;"],
@@ -157,6 +159,9 @@ class LookupShapingTests(unittest.TestCase):
         self.assertEqual(candidates[0].name, "source_fallback_lookup_hit")
         self.assertIn("allow_fallback = 1;", candidates[0].setup)
         self.assertIn("db->items[0].id = 0;", candidates[0].setup)
+        self.assertEqual(candidates[0].branch_facts, [
+            BranchFact("db->items[0].valid", "!=", "0"),
+        ])
 
     def test_lookup_container_setup_builds_owner_for_plain_container_expr(self):
         shape = LookupShape(

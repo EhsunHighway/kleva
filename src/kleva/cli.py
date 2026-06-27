@@ -8,6 +8,8 @@ cli.py — `kleva` command.
     kleva all    <module.yaml>  [--base-dir DIR]   klee + gen (full pipeline)
     kleva run    <header.h>     [--mode all|klee|gen] [--base-dir DIR]
                                 Synthesize in memory and run without YAML
+    kleva coverage-report <facts.yaml> --out report.md
+                                Render report-only candidate coverage facts
     kleva augment <module.yaml> [--source FILE] [--rules FILE]
                                 Add source-derived edge cases
     kleva refine <module.yaml>  [--base-dir DIR]   Refine YAML from pipeline output
@@ -21,7 +23,9 @@ from pathlib import Path
 from .config import load_config, load_config_text
 from .pipeline import run_klee_phase, run_pipeline
 from .synth import SHAPING_FEATURES, generate_yaml_from_header, run_synth
+from .synth_config import load_helper_call_rules
 from .augment import augment_yaml_text, run_augment
+from .coverage_report import write_coverage_report
 from .refiner import run_refine
 
 
@@ -64,6 +68,14 @@ def _add_synth_input_args(p: argparse.ArgumentParser) -> None:
                    help=f"enable only selected synth shapers; choices: {shaping_names}")
     p.add_argument("--no-shaping", action="append", default=None, metavar="NAME[,NAME...]",
                    help=f"disable selected synth shapers from the default set; choices: {shaping_names}")
+    p.add_argument("--ir-backend", choices=("clang-json", "off"), default="clang-json",
+                   help="source IR backend for synthesis shaping (default: clang-json)")
+    p.add_argument("--emit-ir", default=None, metavar="FILE",
+                   help="write extracted typed IR JSON for inspection")
+    p.add_argument("--ir-diagnostics", default=None, metavar="FILE",
+                   help="write controlled IR extraction diagnostics JSON")
+    p.add_argument("--helper-rules", action="append", default=None, metavar="FILE",
+                   help="YAML helper-call repair rules for IR parser shaping (repeat for multiple)")
 
 
 def main() -> None:
@@ -143,6 +155,15 @@ def main() -> None:
     _add_emit_unproved_arg(p_run)
     p_run.add_argument("--quiet", "-q", action="store_true")
 
+    # ── kleva coverage-report ────────────────────────────────────────────────
+    p_coverage = sub.add_parser(
+        "coverage-report",
+        help="Render external coverage facts as a report-only candidate mapping",
+    )
+    _add_help_alias(p_coverage)
+    p_coverage.add_argument("facts", help="YAML file containing candidates and branches")
+    p_coverage.add_argument("--out", "-o", required=True, help="output Markdown report path")
+
     # ── kleva augment ─────────────────────────────────────────────────────────
     p_augment = sub.add_parser(
         "augment",
@@ -182,6 +203,10 @@ def main() -> None:
             extra_sources  = args.extra_sources,
             shaping        = args.shaping,
             no_shaping     = args.no_shaping,
+            ir_backend     = args.ir_backend,
+            emit_ir        = args.emit_ir,
+            ir_diagnostics = args.ir_diagnostics,
+            helper_rules   = args.helper_rules,
         )
         return
 
@@ -194,6 +219,10 @@ def main() -> None:
             extra_sources  = args.extra_sources,
             shaping        = args.shaping,
             no_shaping     = args.no_shaping,
+            ir_backend     = args.ir_backend,
+            emit_ir_path   = args.emit_ir,
+            ir_diagnostics_path = args.ir_diagnostics,
+            helper_call_rules = load_helper_call_rules(args.helper_rules),
         )
         if args.rules:
             yaml_text = augment_yaml_text(
@@ -238,6 +267,11 @@ def main() -> None:
             out    = args.out,
             rules  = args.rules,
         )
+        return
+
+    if args.cmd == "coverage-report":
+        write_coverage_report(args.facts, args.out)
+        print(f"kleva coverage-report: wrote {args.out}", file=sys.stderr)
         return
 
     config_path = Path(args.config)

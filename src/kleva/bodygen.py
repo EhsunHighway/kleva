@@ -6,9 +6,89 @@ from typing import Callable, List, Tuple
 
 from .acsl import ACSLBehavior
 from .ast.model import CFunction, CParam, CTypeCatalog
+from .shaping.candidates import ObjectPathFact
+from .shaping.ir_ownership import CONSUMED, TRANSFERRED, OwnershipSummary
 
 
 BodyResult = Tuple[List[str], List[str], List[str], List[str]]
+
+
+def _param_consumed(ownership: OwnershipSummary | None, name: str) -> bool:
+    return bool(ownership and ownership.param_behavior.get(name) == CONSUMED)
+
+
+def _param_transferred(ownership: OwnershipSummary | None, name: str) -> bool:
+    return bool(ownership and ownership.param_behavior.get(name) == TRANSFERRED)
+
+
+def _param_frees(
+    ownership: OwnershipSummary | None,
+    name: str,
+    source_text: str | None,
+    func_name: str,
+    ops,
+) -> bool:
+    if ownership is not None:
+        return _param_consumed(ownership, name)
+    return ops.function_frees_param(source_text, func_name, name)
+
+
+def _param_takes_ownership(
+    ownership: OwnershipSummary | None,
+    name: str,
+    source_text: str | None,
+    func_name: str,
+    ops,
+) -> bool:
+    if ownership is not None:
+        return _param_transferred(ownership, name)
+    return ops.function_takes_param_ownership(source_text, func_name, name)
+
+
+def _param_accepts_null(
+    ownership: OwnershipSummary | None,
+    name: str,
+    source_text: str | None,
+    func_name: str,
+    ops,
+) -> bool:
+    if ownership is not None:
+        return name in ownership.nullable_params
+    return ops.function_accepts_null_param(source_text, func_name, name)
+
+
+def _returns_owned_pointer(
+    ownership: OwnershipSummary | None,
+    func: CFunction,
+    ops,
+) -> bool:
+    if ownership is not None:
+        return ownership.returns_owned_pointer
+    return ops.function_returns_owned_pointer(func)
+
+
+def _param_needs_len_data_shape(
+    ownership: OwnershipSummary | None,
+    func_name: str,
+    param: CParam,
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+    ops,
+) -> bool:
+    if ownership is not None:
+        return param.name in ownership.buffer_params
+    return ops.needs_len_data_shape(func_name, param.name, source_text, type_catalog, param)
+
+
+def _void_param_cast_types(
+    ownership: OwnershipSummary | None,
+    body: str,
+    func: CFunction,
+    ops,
+) -> dict[str, str]:
+    if ownership is not None:
+        return ownership.void_cast_types
+    return ops.void_param_cast_types(body, func)
 
 
 @dataclass(frozen=True)
@@ -30,7 +110,7 @@ class BodyGenOps:
     function_takes_param_ownership: Callable[[str | None, str, str], bool]
     function_accepts_null_param: Callable[[str | None, str, str], bool]
     function_returns_owned_pointer: Callable[[CFunction], bool]
-    lookup_free_fn: Callable[[str, str | None], str | None]
+    lookup_free_fn: Callable[[str, str | None, dict[str, CFunction] | None], str | None]
     assumption_setup_lines: Callable[..., list[str]]
     source_for_branch_shaping: Callable[[str | None, str], str]
     void_param_cast_types: Callable[[str, CFunction], dict[str, str]]
@@ -106,6 +186,7 @@ def append_source_witness_outputs(
     source_text: str | None,
     type_catalog: CTypeCatalog | None,
     ops: BodyGenOps,
+    ownership: OwnershipSummary | None = None,
 ) -> None:
     """
     Add generic post-call witnesses for mutable pointer parameters.
@@ -124,7 +205,7 @@ def append_source_witness_outputs(
             continue
         if p.name not in active_params or p.name not in param_refs:
             continue
-        if ops.function_frees_param(source_text, func.name, p.name):
+        if _param_frees(ownership, p.name, source_text, func.name, ops):
             continue
         if not type_catalog.is_complete_struct(p.base_type):
             continue
@@ -133,6 +214,9 @@ def append_source_witness_outputs(
         for field_name, field_param in type_catalog.struct_fields.get(p.base_type, {}).items():
             out_name = ops.safe_c_name(f"out_{p.name}_{field_name}")
             expr = field_expr(base_expr, access, field_name)
+
+            if field_param.is_array or "[" in field_param.raw_type:
+                continue
 
             if field_param.is_pointer or type_catalog.function_pointer(field_param.base_type):
                 if out_name not in seen:
@@ -149,13 +233,15 @@ def append_source_witness_outputs(
                     seen.add(out_name)
                 continue
 
-            if "[" in field_param.raw_type or not type_catalog.is_complete_struct(field_param.base_type):
+            if not type_catalog.is_complete_struct(field_param.base_type):
                 continue
 
             nested_access = f"{access}{field_name}."
             for nested_name, nested_param in type_catalog.struct_fields.get(field_param.base_type, {}).items():
                 nested_out = ops.safe_c_name(f"out_{p.name}_{field_name}_{nested_name}")
                 nested_expr = field_expr(base_expr, nested_access, nested_name)
+                if nested_param.is_array or "[" in nested_param.raw_type:
+                    continue
                 if nested_param.is_pointer or type_catalog.function_pointer(nested_param.base_type):
                     if nested_out not in seen:
                         lines.append(f"int {nested_out}_nonnull = ({nested_expr} != NULL);")
@@ -169,6 +255,107 @@ def append_source_witness_outputs(
                     seen.add(nested_out)
 
 
+def object_path_setup_lines(
+    object_paths: list[ObjectPathFact],
+    active_params: dict[str, CParam],
+    param_refs: dict[str, tuple[str, str]],
+    type_catalog: CTypeCatalog | None,
+    used_names: set[str],
+    unique_name: Callable[[str, set[str]], str],
+) -> list[str]:
+    if not object_paths or not type_catalog:
+        return []
+
+    lines: list[str] = []
+    seen_assignments: set[tuple[str, tuple[str, ...]]] = set()
+    for fact in object_paths:
+        if not fact.path or fact.root not in active_params or fact.root not in param_refs:
+            continue
+
+        current_type = active_params[fact.root].base_type
+        current_expr, current_access = param_refs[fact.root]
+        if len(fact.path) == 1:
+            field_param = type_catalog.field_type(current_type, fact.path[0])
+            if field_param and field_param.is_pointer and type_catalog.is_complete_struct(field_param.base_type):
+                field_ref = f"{current_expr}{current_access}{fact.path[0]}"
+                key = (fact.root, fact.path)
+                if key not in seen_assignments:
+                    seen_assignments.add(key)
+                    obj_name = unique_name(f"{fact.root}_{fact.path[0]}_0", used_names)
+                    lines.append(f"{field_param.base_type} {obj_name};")
+                    lines.append(f"memset(&{obj_name}, 0, sizeof({obj_name}));")
+                    if field_param.pointer_depth >= 2:
+                        lines.append(f"{field_ref}[0] = &{obj_name};")
+                    else:
+                        lines.append(f"{field_ref} = &{obj_name};")
+            continue
+
+        walked: list[str] = []
+        for field in fact.path[:-1]:
+            field_param = type_catalog.field_type(current_type, field)
+            if field_param is None:
+                break
+
+            walked.append(field)
+            field_expr = f"{current_expr}{current_access}{field}"
+            if field_param.is_pointer:
+                if not type_catalog.is_complete_struct(field_param.base_type):
+                    break
+                key = (fact.root, tuple(walked))
+                if key not in seen_assignments:
+                    seen_assignments.add(key)
+                    obj_name = unique_name(f"{fact.root}_{'_'.join(walked)}", used_names)
+                    lines.append(f"{field_param.base_type} {obj_name};")
+                    lines.append(f"memset(&{obj_name}, 0, sizeof({obj_name}));")
+                    lines.append(f"{field_expr} = &{obj_name};")
+                current_type = field_param.base_type
+                current_expr = field_expr
+                current_access = "->"
+                continue
+
+            if not type_catalog.is_complete_struct(field_param.base_type):
+                break
+            current_type = field_param.base_type
+            current_expr = field_expr
+            current_access = "."
+    return lines
+
+
+def _object_path_backed(
+    setup_lines: list[str],
+    fact: ObjectPathFact,
+    param_refs: dict[str, tuple[str, str]],
+) -> bool:
+    if not fact.path or fact.root not in param_refs:
+        return False
+    base_expr, access = param_refs[fact.root]
+    prefix = f"{base_expr}{access}{fact.path[0]} ="
+    return any(line.strip().startswith(prefix) for line in setup_lines)
+
+
+def _paths_for_root(
+    object_paths: list[ObjectPathFact] | None,
+    root: str,
+) -> list[tuple[str, ...]] | None:
+    if not object_paths:
+        return None
+    paths = [fact.path for fact in object_paths if fact.root == root]
+    return paths or None
+
+
+def _candidate_mentions_param(lines: list[str] | None, param_name: str) -> bool:
+    if not lines:
+        return False
+    return any(re.search(rf"\b{re.escape(param_name)}\b", line) for line in lines)
+
+
+def _local_scalar_decl(p: CParam, value: str) -> str:
+    raw_type = p.raw_type.strip()
+    if re.search(rf"\b{re.escape(p.name)}\b", raw_type):
+        return f"{raw_type} = {value};"
+    return f"{raw_type} {p.name} = {value};"
+
+
 def gen_null_setup_body(
     func: CFunction,
     null_params: list[str],
@@ -178,6 +365,7 @@ def gen_null_setup_body(
     function_decls: dict[str, CFunction] | None,
     shaping_features: set[str] | None,
     ops: BodyGenOps,
+    ownership: OwnershipSummary | None = None,
 ) -> BodyResult:
     """
     Generate (body_lines, output_vars, cleanup_lines) for a null-guard test.
@@ -212,12 +400,12 @@ def gen_null_setup_body(
             call_args.append("NULL")
             param_args[p.name] = "NULL"
         elif p.is_pointer:
-            frees_param = ops.function_frees_param(source_text, func.name, p.name)
-            takes_ownership = ops.function_takes_param_ownership(source_text, func.name, p.name)
+            frees_param = _param_frees(ownership, p.name, source_text, func.name, ops)
+            takes_ownership = _param_takes_ownership(ownership, p.name, source_text, func.name, ops)
             owns_or_frees_param = frees_param or takes_ownership
             suppress_constructor_guard = (
                 frees_param and
-                ops.function_accepts_null_param(source_text, func.name, p.name)
+                _param_accepts_null(ownership, p.name, source_text, func.name, ops)
             )
             prefer_raw_heap = (
                 frees_param
@@ -234,7 +422,7 @@ def gen_null_setup_body(
                 prefer_raw_heap=prefer_raw_heap,
             )
             lines.extend(setup)
-            if ops.needs_len_data_shape(func.name, p.name, source_text, type_catalog, p):
+            if _param_needs_len_data_shape(ownership, func.name, p, source_text, type_catalog, ops):
                 ops.append_len_data_shape(lines, arg)
             call_args.append(arg)
             param_args[p.name] = arg
@@ -293,6 +481,11 @@ def gen_valid_setup_body(
     source_shape_oracle: bool,
     source_shape_witnesses: bool,
     ops: BodyGenOps,
+    ownership: OwnershipSummary | None = None,
+    object_paths: list[ObjectPathFact] | None = None,
+    call_arg_overrides: dict[str, str] | None = None,
+    witness_setup: list[str] | None = None,
+    extra_outputs: list[str] | None = None,
 ) -> BodyResult:
     """
     Generate (body_lines, output_vars, cleanup_lines) for a valid-path test.
@@ -309,12 +502,14 @@ def gen_valid_setup_body(
     param_args: dict[str, str] = {}
     param_refs: dict[str, tuple[str, str]] = {}
     enabled_features = shaping_features if shaping_features is not None else set(ops.default_shaping_features)
-    void_cast_types = ops.void_param_cast_types(ops.source_for_branch_shaping(source_text, func.name), func)
+    void_cast_body = "" if ownership is not None else ops.source_for_branch_shaping(source_text, func.name)
+    void_cast_types = _void_param_cast_types(ownership, void_cast_body, func, ops)
     non_null_params = set(ops.extract_non_null_params(behavior.assumes))
     nonzero_params = set(ops.extract_nonzero_params(behavior.assumes))
     scalar_values = ops.scalar_values_from_assumptions(behavior.assumes)
     object_params = set(valid_params) | non_null_params
     result_val = ops.extract_result_value(behavior.ensures)
+    candidate_setup_lines = [*(extra_setup or []), *(witness_setup or [])]
 
     for p in func.params:
         if p.is_array:
@@ -335,12 +530,12 @@ def gen_valid_setup_body(
                 call_args.append("NULL")
                 param_args[p.name] = "NULL"
         elif p.is_pointer and p.name in valid_params:
-            frees_param = ops.function_frees_param(source_text, func.name, p.name)
-            takes_ownership = ops.function_takes_param_ownership(source_text, func.name, p.name)
+            frees_param = _param_frees(ownership, p.name, source_text, func.name, ops)
+            takes_ownership = _param_takes_ownership(ownership, p.name, source_text, func.name, ops)
             owns_or_frees_param = frees_param or takes_ownership
             suppress_constructor_guard = (
                 frees_param and
-                ops.function_accepts_null_param(source_text, func.name, p.name)
+                _param_accepts_null(ownership, p.name, source_text, func.name, ops)
             )
             prefer_raw_heap = (
                 frees_param
@@ -355,9 +550,10 @@ def gen_valid_setup_body(
                 prefer_constructor=frees_param and result_val != -1,
                 suppress_constructor_guard=suppress_constructor_guard,
                 prefer_raw_heap=prefer_raw_heap,
+                required_paths=_paths_for_root(object_paths, p.name),
             )
             lines.extend(setup)
-            if ops.needs_len_data_shape(func.name, p.name, source_text, type_catalog, p):
+            if _param_needs_len_data_shape(ownership, func.name, p, source_text, type_catalog, ops):
                 ops.append_len_data_shape(lines, arg)
             call_args.append(arg)
             param_args[p.name] = arg
@@ -381,16 +577,47 @@ def gen_valid_setup_body(
             value = scalar_values.get(p.name)
             if value is None:
                 value = "1" if p.name in nonzero_params and lo == 0 else str(lo)
-            call_args.append(value)
-            param_args[p.name] = value
+            if _candidate_mentions_param(candidate_setup_lines, p.name):
+                lines.append(_local_scalar_decl(p, value))
+                call_args.append(p.name)
+                param_args[p.name] = p.name
+            else:
+                call_args.append(value)
+                param_args[p.name] = value
         else:
             value = scalar_values.get(p.name, "0")
-            call_args.append(value)
-            param_args[p.name] = value
+            if _candidate_mentions_param(candidate_setup_lines, p.name):
+                lines.append(_local_scalar_decl(p, value))
+                call_args.append(p.name)
+                param_args[p.name] = p.name
+            else:
+                call_args.append(value)
+                param_args[p.name] = value
 
     lines.extend(ops.assumption_setup_lines(behavior.assumes, active_params, source_text, param_refs, param_args, shaping_features))
+    if object_paths:
+        missing_object_paths = [
+            fact for fact in object_paths
+            if not _object_path_backed(lines, fact, param_refs)
+        ]
+        lines.extend(object_path_setup_lines(
+            missing_object_paths,
+            active_params,
+            param_refs,
+            type_catalog,
+            used_names,
+            ops.unique_name,
+        ))
     if extra_setup:
         lines.extend(ops.rewrite_setup_with_param_args(extra_setup, param_args))
+
+    if call_arg_overrides:
+        for index, p in enumerate(func.params):
+            override = call_arg_overrides.get(p.name)
+            if override is None:
+                continue
+            call_args[index] = override
+            param_args[p.name] = override
 
     args_str = ", ".join(call_args)
 
@@ -406,6 +633,7 @@ def gen_valid_setup_body(
                 source_text,
                 type_catalog,
                 ops,
+                ownership,
             )
         if not outputs:
             out_var = "out_ok"
@@ -420,8 +648,8 @@ def gen_valid_setup_body(
             lines.append(f"int {nonnull_var} = ({out_var} != NULL);")
             outputs.append(nonnull_var)
             append_return_field_outputs(lines, outputs, func, out_var, param_args, type_catalog, ops.scalar_bounds)
-            if ops.function_returns_owned_pointer(func):
-                free_fn = ops.lookup_free_fn(func.return_base, source_text)
+            if _returns_owned_pointer(ownership, func, ops):
+                free_fn = ops.lookup_free_fn(func.return_base, source_text, function_decls)
                 if free_fn:
                     cleanup.insert(0, f"if ({out_var}) {free_fn}({out_var});")
         else:
@@ -437,6 +665,11 @@ def gen_valid_setup_body(
         lines.append(f"{out_var} = 1;")
         outputs.append(out_var)
 
+    if witness_setup:
+        lines.extend(ops.rewrite_setup_with_param_args(witness_setup, param_args))
+    if extra_outputs:
+        outputs.extend(extra_outputs)
+
     return lines, outputs, cleanup, preamble
 
 
@@ -448,6 +681,7 @@ def gen_mixed_test(
     function_decls: dict[str, CFunction] | None,
     shaping_features: set[str] | None,
     ops: BodyGenOps,
+    ownership: OwnershipSummary | None = None,
 ) -> BodyResult:
     """
     Generate body for a mixed behavior where some params are null
@@ -459,12 +693,12 @@ def gen_mixed_test(
 
     if null_params and not valid_params:
         return gen_null_setup_body(
-            func, null_params, behavior, source_text, type_catalog, function_decls, shaping_features, ops
+            func, null_params, behavior, source_text, type_catalog, function_decls, shaping_features, ops, ownership
         )
 
     if valid_params and not null_params:
         return gen_valid_setup_body(
-            func, valid_params, behavior, source_text, type_catalog, function_decls, None, shaping_features, False, False, ops
+            func, valid_params, behavior, source_text, type_catalog, function_decls, None, shaping_features, False, False, ops, ownership
         )
 
     lines: list[str] = []
@@ -486,12 +720,12 @@ def gen_mixed_test(
             call_args.append("NULL")
             param_args[p.name] = "NULL"
         elif p.is_pointer:
-            frees_param = ops.function_frees_param(source_text, func.name, p.name)
-            takes_ownership = ops.function_takes_param_ownership(source_text, func.name, p.name)
+            frees_param = _param_frees(ownership, p.name, source_text, func.name, ops)
+            takes_ownership = _param_takes_ownership(ownership, p.name, source_text, func.name, ops)
             owns_or_frees_param = frees_param or takes_ownership
             suppress_constructor_guard = (
                 frees_param and
-                ops.function_accepts_null_param(source_text, func.name, p.name)
+                _param_accepts_null(ownership, p.name, source_text, func.name, ops)
             )
             prefer_raw_heap = (
                 frees_param
@@ -508,7 +742,7 @@ def gen_mixed_test(
                 prefer_raw_heap=prefer_raw_heap,
             )
             lines.extend(setup)
-            if ops.needs_len_data_shape(func.name, p.name, source_text, type_catalog, p):
+            if _param_needs_len_data_shape(ownership, func.name, p, source_text, type_catalog, ops):
                 ops.append_len_data_shape(lines, arg)
             call_args.append(arg)
             param_args[p.name] = arg

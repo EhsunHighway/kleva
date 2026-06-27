@@ -12,6 +12,11 @@ class CParam:
     is_const:    bool
     is_array:    bool
     array_size:  int
+    pointer_depth: int = 0
+
+    def __post_init__(self) -> None:
+        if self.pointer_depth == 0 and "*" in self.raw_type:
+            self.pointer_depth = self.raw_type.count("*")
 
 
 @dataclass
@@ -52,4 +57,3 @@ class CTypeCatalog:
 
     def field_type(self, type_name: str, field_name: str) -> CParam | None:
         return self.struct_fields.get(type_name, {}).get(field_name)
-

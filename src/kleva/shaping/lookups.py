@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..ast.model import CTypeCatalog, DerivedLocal
-from .candidates import BranchCandidate
+from .candidates import BranchCandidate, BranchFact
 
 
 @dataclass
@@ -51,6 +51,7 @@ class LookupFixtureOps:
 @dataclass(frozen=True)
 class FallbackLookupOps:
     strip_comments:                Callable[[str], str]
+    expand_alias_expr:             Callable[[str, dict[str, tuple[str, str]]], str]
     good_path_setup_from_source:    Callable[..., list[str]]
     alias_pointer_guard_setup:      Callable[..., list[str]]
     condition_setup_lines:          Callable[..., list[str]]
@@ -187,6 +188,45 @@ def lookup_condition_setup(
             ops.append_unique(setup, f"{elem}.{field} = {ops.nonmatching_value(rhs)};", seen)
 
     return setup
+
+
+def lookup_branch_facts(
+    shape: LookupShape,
+    aliases: dict[str, tuple[str, str]],
+    expand_alias_expr: Callable[[str, dict[str, tuple[str, str]]], str],
+) -> list[BranchFact]:
+    facts: list[BranchFact] = []
+    seen: set[BranchFact] = set()
+    container_expr = expand_alias_expr(shape.container_expr, aliases)
+    elem = f"{container_expr}->{shape.array_field}[0]"
+
+    def add(field: str, relation: str, rhs: str) -> None:
+        value = shape.param_args.get(rhs, rhs)
+        fact = BranchFact(f"{elem}.{field}", relation, value)
+        if fact not in seen:
+            seen.add(fact)
+            facts.append(fact)
+
+    for cond in shape.conditions:
+        for field, rhs in re.findall(
+            rf"{re.escape(shape.element_alias)}->(\w+)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            cond,
+        ):
+            add(field, "==", rhs)
+
+        for field in re.findall(
+            rf"{re.escape(shape.element_alias)}->(\w+)(?:\s*&&|\s*\)|\s*$)",
+            cond,
+        ):
+            add(field, "!=", "0")
+
+        for field, rhs in re.findall(
+            rf"{re.escape(shape.element_alias)}->(\w+)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            cond,
+        ):
+            add(field, "!=", rhs)
+
+    return facts
 
 
 def lookup_miss_setup(
@@ -362,6 +402,11 @@ def fallback_lookup_candidates(
         if name in seen:
             continue
         seen.add(name)
-        candidates.append(BranchCandidate(name, setup))
+        candidates.append(BranchCandidate(
+            name,
+            setup,
+            origin="regex",
+            branch_facts=lookup_branch_facts(shape, aliases, fallback_ops.expand_alias_expr),
+        ))
 
     return candidates

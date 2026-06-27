@@ -41,7 +41,14 @@ class AstParserTests(unittest.TestCase):
         self.assertEqual([func.name for func in funcs], ["table_lookup"])
         self.assertEqual(funcs[0].params[0].name, "table")
         self.assertTrue(funcs[0].params[0].is_pointer)
+        self.assertEqual(funcs[0].params[0].pointer_depth, 1)
         self.assertEqual(funcs[0].params[1].base_type, "uint16_t")
+
+    def test_parse_function_decls_tracks_pointer_depth(self):
+        funcs = parse_function_decls("int fill(char **out, int *count);")
+
+        self.assertEqual(funcs[0].params[0].pointer_depth, 2)
+        self.assertEqual(funcs[0].params[1].pointer_depth, 1)
 
     def test_function_decl_map_includes_static_definitions(self):
         source = """

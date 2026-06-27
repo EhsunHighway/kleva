@@ -55,11 +55,16 @@ def lookup_constructor(
     return None
 
 
-def lookup_free_fn(base_type: str, source_text: str | None = None) -> str | None:
+def lookup_free_fn(
+    base_type: str,
+    source_text: str | None = None,
+    function_decls: dict[str, CFunction] | None = None,
+) -> str | None:
     """
     Guess the free/destroy function for a type.
     Uses naming conventions: T_free(), T_destroy().
     """
+    function_decls = function_decls or {}
     lower_type = lower_first(base_type)
     snake_type = camel_to_snake(base_type)
     candidates = [
@@ -70,6 +75,9 @@ def lookup_free_fn(base_type: str, source_text: str | None = None) -> str | None
         f"free_{lower_type}",
         f"free_{snake_type}",
     ]
+    for candidate in candidates:
+        if candidate in function_decls:
+            return candidate
     for candidate in candidates:
         if visible_function(candidate, source_text):
             return candidate
@@ -230,7 +238,7 @@ def constructor_setup(
         lines.append(f"__GUARD__({var_name})")
 
     cleanup: list[str] = []
-    free_fn = lookup_free_fn(base_type, source_text)
+    free_fn = lookup_free_fn(base_type, source_text, function_decls)
     if free_fn:
         if _needs_forward_typedef(base_type):
             lines.append(f"typedef struct {base_type} {base_type};")
@@ -245,6 +253,7 @@ def complete_struct_setup(
     type_catalog: CTypeCatalog,
     used_names: set[str],
     depth: int = 0,
+    required_paths: list[tuple[str, ...]] | None = None,
 ) -> list[str]:
     lines = [
         f"{base_type} {var_name};",
@@ -254,6 +263,36 @@ def complete_struct_setup(
         return lines
 
     for field_name, field_param in type_catalog.struct_fields.get(base_type, {}).items():
+        nested_required_paths = _nested_required_paths(required_paths, field_name)
+        if required_paths is not None and nested_required_paths is None:
+            continue
+
+        if field_param.is_array:
+            if field_param.base_type == base_type:
+                continue
+            if not type_catalog.is_complete_struct(field_param.base_type):
+                continue
+
+            nested_name = unique_name(f"{var_name}_{field_name}_0", used_names)
+            lines.extend(complete_struct_setup(
+                field_param.base_type,
+                nested_name,
+                type_catalog,
+                used_names,
+                depth + 1,
+                nested_required_paths,
+            ))
+            if field_param.is_pointer:
+                if field_param.pointer_depth >= 2:
+                    slot_name = unique_name(f"{nested_name}_slot", used_names)
+                    lines.append(f"{field_param.base_type} *{slot_name} = &{nested_name};")
+                    lines.append(f"{var_name}.{field_name}[0] = &{slot_name};")
+                else:
+                    lines.append(f"{var_name}.{field_name}[0] = &{nested_name};")
+            else:
+                lines.append(f"{var_name}.{field_name}[0] = {nested_name};")
+            continue
+
         if not field_param.is_pointer:
             continue
         if field_param.base_type == base_type:
@@ -268,8 +307,9 @@ def complete_struct_setup(
             type_catalog,
             used_names,
             depth + 1,
+            nested_required_paths,
         ))
-        pointer_depth = field_param.raw_type.count("*")
+        pointer_depth = field_param.pointer_depth
         if pointer_depth >= 2:
             slot_name = unique_name(f"{nested_name}_slot", used_names)
             lines.append(f"{field_param.base_type} *{slot_name} = &{nested_name};")
@@ -278,6 +318,18 @@ def complete_struct_setup(
             lines.append(f"{var_name}.{field_name} = &{nested_name};")
 
     return lines
+
+
+def _nested_required_paths(
+    required_paths: list[tuple[str, ...]] | None,
+    field_name: str,
+) -> list[tuple[str, ...]] | None:
+    if required_paths is None:
+        return None
+    nested = [path[1:] for path in required_paths if path and path[0] == field_name and len(path) > 1]
+    if any(path and path[0] == field_name for path in required_paths):
+        return nested
+    return None
 
 
 def pointer_argument_setup(
@@ -292,6 +344,7 @@ def pointer_argument_setup(
     prefer_constructor: bool = False,
     suppress_constructor_guard: bool = False,
     prefer_raw_heap: bool = False,
+    required_paths: list[tuple[str, ...]] | None = None,
 ) -> tuple[list[str], str, list[str]]:
     """Generate setup lines, call argument, and cleanup for one pointer param."""
     used_names = used_names or set()
@@ -338,13 +391,6 @@ def pointer_argument_setup(
             cleanup = []
         return lines, arg, cleanup
 
-    if type_catalog and type_catalog.is_complete_struct(p.base_type):
-        return (
-            complete_struct_setup(p.base_type, var_name, type_catalog, used_names),
-            f"&{var_name}",
-            [],
-        )
-
     if constructor:
         lines, arg, cleanup = constructor_setup(
             constructor,
@@ -360,6 +406,13 @@ def pointer_argument_setup(
         if cleanup and cleanup[0].startswith(f"{owner_func}("):
             cleanup = []
         return lines, arg, cleanup
+
+    if type_catalog and type_catalog.is_complete_struct(p.base_type):
+        return (
+            complete_struct_setup(p.base_type, var_name, type_catalog, used_names, required_paths=required_paths),
+            f"&{var_name}",
+            [],
+        )
 
     return (
         [f"/* kleva synth: no visible allocation strategy for {p.base_type} *{p.name}; using NULL */"],

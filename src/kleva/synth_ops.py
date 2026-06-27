@@ -12,19 +12,6 @@ from .acsl_contract import (
     scalar_values_from_assumptions as _scalar_values_from_assumptions,
 )
 from .ast.model import CFunction, CParam, CTypeCatalog, DerivedLocal
-from .ast.parser import (
-    function_decl_map as _function_decl_map,
-    split_call_args as _split_call_args,
-    strip_comments as _strip_comments,
-)
-from .ast.source_query import (
-    function_body as _function_body,
-    function_accepts_null_param as _function_accepts_null_param,
-    function_definition_body as _function_definition_body,
-    function_frees_param as _function_frees_param,
-    function_returns_owned_pointer as _function_returns_owned_pointer,
-    function_takes_param_ownership as _function_takes_param_ownership,
-)
 from .bodygen import (
     BodyGenOps,
     append_return_field_outputs as _bodygen_append_return_field_outputs,
@@ -36,6 +23,15 @@ from .bodygen import (
     is_observable_scalar_type as _bodygen_is_observable_scalar_type,
     param_ref_from_arg as _bodygen_param_ref_from_arg,
 )
+from .compat.source_fallbacks import fallback_function_accepts_null_param as _fallback_function_accepts_null_param
+from .compat.source_fallbacks import fallback_function_body as _fallback_function_body
+from .compat.source_fallbacks import fallback_function_decl_map as _fallback_function_decl_map
+from .compat.source_fallbacks import fallback_function_definition_body as _fallback_function_definition_body
+from .compat.source_fallbacks import fallback_function_frees_param as _fallback_function_frees_param
+from .compat.source_fallbacks import fallback_function_returns_owned_pointer as _fallback_function_returns_owned_pointer
+from .compat.source_fallbacks import fallback_function_takes_param_ownership as _fallback_function_takes_param_ownership
+from .compat.source_fallbacks import fallback_split_call_args as _fallback_split_call_args
+from .compat.source_fallbacks import fallback_strip_comments as _fallback_strip_comments
 from .fixtures.buffers import (
     append_len_data_shape as _buffer_fixture_append_len_data_shape,
     needs_len_data_shape as _buffer_fixture_needs_len_data_shape,
@@ -70,14 +66,27 @@ from .shaping.callees import (
 )
 from .shaping.conditions import (
     ConditionSetupOps,
-    FunctionPointerConditionOps,
-    condition_function_pointer_setup as _condition_shaper_function_pointer_setup,
     condition_setup_lines as _condition_shaper_setup_lines,
     rewrite_result_expr as _condition_shaper_rewrite_result_expr,
     rewrite_source_alias_exprs as _condition_shaper_rewrite_source_alias_exprs,
     split_conjuncts as _condition_shaper_split_conjuncts,
     strip_outer_parens as _condition_shaper_strip_outer_parens,
 )
+from .shaping.ir_conditions import (
+    IrConditionOps,
+    condition_candidates_from_ir as _ir_condition_candidates,
+)
+from .shaping.ir_byte_order import decoded_field_aliases_from_ir as _ir_decoded_field_aliases
+from .shaping.ir_callbacks import callback_candidates_from_ir as _ir_callback_candidates
+from .shaping.ir_callees import callee_candidates_from_ir as _ir_callee_candidates
+from .shaping.ir_ownership import classify_ownership_from_ir as _ir_classify_ownership
+from .shaping.ir_parsers import (
+    HelperCallRule,
+    IrParserOps,
+    parser_candidates_from_ir as _ir_parser_candidates,
+)
+from .shaping.ir_lookups import fallback_lookup_candidates_from_ir as _ir_lookup_candidates
+from .shaping.ir_tables import table_candidates_from_ir as _ir_table_candidates
 from .shaping.lookups import (
     FallbackLookupOps,
     LookupFixtureOps,
@@ -114,6 +123,7 @@ from .shaping.switches import (
     state_switch_candidates as _switch_shaper_state_switch_candidates,
     switch_case_blocks as _switch_shaper_case_blocks,
 )
+from .shaping.ir_switches import state_switch_candidates_from_ir as _ir_state_switch_candidates
 from .shaping.tables import (
     TableShapeOps,
     loop_table_candidates as _table_shaper_loop_table_candidates,
@@ -184,16 +194,7 @@ def _assumption_setup_lines(
 
 
 def _source_for_branch_shaping(source_text: str | None, func_name: str) -> str:
-    body = _function_body(source_text, func_name)
-    if not body:
-        return ""
-    for callee in re.findall(r"\b(?:return\s+)?(\w+)\s*\(", body):
-        if callee == func_name or callee in {"if", "while", "switch", "for", "return"}:
-            continue
-        callee_body = _function_body(source_text, callee)
-        if callee_body:
-            body += "\n" + callee_body
-    return body
+    return _fallback_function_body(source_text, func_name)
 
 
 def _cast_aliases(body: str, params: dict[str, CParam]) -> dict[str, tuple[str, str]]:
@@ -210,12 +211,21 @@ def _rewrite_setup_with_param_args(setup: list[str], param_args: dict[str, str])
     for line in setup:
         new_line = line
         for name, arg in sorted(param_args.items(), key=lambda item: len(item[0]), reverse=True):
+            if arg.startswith("&") and re.fullmatch(r"&[A-Za-z_]\w*", arg):
+                obj = arg[1:]
+                new_line = re.sub(
+                    rf"\b{re.escape(name)}->",
+                    f"{obj}.",
+                    new_line,
+                )
+                new_line = re.sub(rf"(?<![&\w]){re.escape(name)}\b(?!\.)", arg, new_line)
+                continue
             new_line = re.sub(
                 rf"\b{re.escape(name)}->",
                 f"({arg})->",
                 new_line,
             )
-            new_line = re.sub(rf"(?<![&\w]){re.escape(name)}\b", arg, new_line)
+            new_line = re.sub(rf"(?<![&\w]){re.escape(name)}\b(?!\.)", arg, new_line)
         rewritten.append(new_line)
     return rewritten
 
@@ -352,7 +362,7 @@ def _infer_lookup_shape(
         caller_body,
         source_text,
         type_catalog,
-        LookupInferOps(_function_decl_map, _function_body, _split_call_args),
+        LookupInferOps(_fallback_function_decl_map, _fallback_function_body, _fallback_split_call_args),
     )
 
 
@@ -369,7 +379,7 @@ def _infer_lookup_shape_for_call(
         args_raw,
         source_text,
         type_catalog,
-        LookupInferOps(_function_decl_map, _function_body, _split_call_args),
+        LookupInferOps(_fallback_function_decl_map, _fallback_function_body, _fallback_split_call_args),
     )
 
 
@@ -419,34 +429,11 @@ def _condition_setup_lines(
     )
 
 
-def _condition_function_pointer_setup(
-    condition: str,
-    result_var: str,
-    result_expr: str,
-    result_type: str,
-    type_catalog: CTypeCatalog | None,
-) -> tuple[list[str], list[str]]:
-    return _condition_shaper_function_pointer_setup(
-        condition,
-        result_var,
-        result_expr,
-        result_type,
-        type_catalog,
-        FunctionPointerConditionOps(
-            _split_conjuncts,
-            _strip_outer_parens,
-            _append_unique,
-            _function_pointer_stub_preamble,
-            _function_pointer_stub_name,
-        ),
-    )
-
-
 def _callee_success_ops() -> CalleeSuccessOps:
     return CalleeSuccessOps(
-        _function_decl_map,
-        _function_definition_body,
-        _split_call_args,
+        _fallback_function_decl_map,
+        _fallback_function_definition_body,
+        _fallback_split_call_args,
         _append_unique,
         _nonmatching_value,
         _literal_or_macro_value,
@@ -564,7 +551,6 @@ def _state_switch_candidates(
             _lookup_condition_setup,
             _expand_alias_expr,
             _condition_setup_lines,
-            _condition_function_pointer_setup,
             _callee_success_setups_in_block,
             _rewrite_source_alias_exprs,
             _safe_c_name,
@@ -593,9 +579,10 @@ def _fallback_lookup_candidates(
         derived_aliases,
         type_catalog,
         shaping_features,
-        LookupInferOps(_function_decl_map, _function_body, _split_call_args),
+        LookupInferOps(_fallback_function_decl_map, _fallback_function_body, _fallback_split_call_args),
         FallbackLookupOps(
-            _strip_comments,
+            _fallback_strip_comments,
+            _expand_alias_expr,
             _good_path_setup_from_source,
             _alias_pointer_guard_setup,
             _condition_setup_lines,
@@ -668,21 +655,111 @@ def _nonmatching_value(value: str) -> str:
     return "0"
 
 
+def _ir_condition_shape_candidates(function_ir) -> list[BranchCandidate]:
+    return _ir_condition_candidates(
+        function_ir,
+        _ir_condition_ops(function_ir),
+    )
+
+
+def _ir_condition_ops(function_ir) -> IrConditionOps:
+    return IrConditionOps(_safe_c_name, _nonmatching_value, _ir_decoded_field_aliases(function_ir), _host_to_network_fn)
+
+
+def _ir_state_switch_shape_candidates(
+    function_ir,
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+) -> list[BranchCandidate]:
+    return _ir_state_switch_candidates(function_ir, _ir_condition_ops(function_ir), helper_irs, helper_params)
+
+
+def _ir_callback_shape_candidates(function_ir, func: CFunction, type_catalog: CTypeCatalog | None) -> list[BranchCandidate]:
+    return _ir_callback_candidates(
+        function_ir,
+        func,
+        type_catalog,
+        _function_pointer_stub_preamble,
+        _function_pointer_stub_name,
+    )
+
+
+def _ir_callee_shape_candidates(
+    function_ir,
+    source_text: str | None,
+    type_catalog: CTypeCatalog | None,
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+) -> list[BranchCandidate]:
+    def setup_for_call(callee: str, args: list[str]) -> tuple[list[str], list[str]]:
+        return _callee_success_setup_for_call(callee, args, source_text, type_catalog)
+
+    return _ir_callee_candidates(function_ir, setup_for_call, helper_irs, helper_params)
+
+
+def _ir_parser_shape_candidates(
+    function_ir,
+    helper_call_rules: tuple[HelperCallRule, ...] = (),
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+) -> list[BranchCandidate]:
+    return _ir_parser_candidates(function_ir, IrParserOps(_safe_c_name, helper_call_rules, helper_irs, helper_params))
+
+
+def _ir_table_shape_candidates(function_ir) -> list[BranchCandidate]:
+    return _ir_table_candidates(function_ir)
+
+
+def _ir_lookup_shape_candidates(
+    function_ir,
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+) -> list[BranchCandidate]:
+    return _ir_lookup_candidates(function_ir, _ir_condition_ops(function_ir), helper_irs, helper_params)
+
+
+def _ownership_summary_from_ir(func: CFunction, function_ir):
+    if function_ir is None:
+        return None
+    return _ir_classify_ownership(
+        function_ir,
+        {p.name for p in func.params if p.is_pointer},
+        void_param_names={p.name for p in func.params if _is_void_star(p)},
+    )
+
+
 def _source_branch_candidates(
     func: CFunction,
     behavior: ACSLBehavior,
     source_text: str | None,
     type_catalog: CTypeCatalog | None = None,
     shaping_features: set[str] | None = None,
+    function_ir = None,
+    helper_call_rules: tuple[HelperCallRule, ...] = (),
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
 ) -> list[BranchCandidate]:
     """
-    Generate static source-shaped path candidates from the function body.
+    Generate static implementation-shaped path candidates.
 
     These are not tests yet. They are extra fixture variants that must still
     pass KLEE/EVA/native certification before unit tests are emitted.
     """
     if shaping_features is None:
         shaping_features = set(DEFAULT_SHAPING_FEATURES)
+
+    def ir_callee_candidates(function_ir, source_text, type_catalog):
+        return _ir_callee_shape_candidates(function_ir, source_text, type_catalog, helper_irs, helper_params)
+
+    def ir_parser_candidates(function_ir):
+        return _ir_parser_shape_candidates(function_ir, helper_call_rules, helper_irs, helper_params)
+
+    def ir_state_switch_candidates(function_ir):
+        return _ir_state_switch_shape_candidates(function_ir, helper_irs, helper_params)
+
+    def ir_lookup_candidates(function_ir):
+        return _ir_lookup_shape_candidates(function_ir, helper_irs, helper_params)
+
     return _branch_shaper_source_branch_candidates(
         func,
         source_text,
@@ -703,11 +780,19 @@ def _source_branch_candidates(
             _literal_or_macro_value,
             _safe_c_name,
             _is_void_star,
+            _ir_condition_shape_candidates,
+            _ir_callback_shape_candidates,
+            ir_callee_candidates,
+            ir_parser_candidates,
+            _ir_table_shape_candidates,
             _loop_table_candidates,
             _state_switch_candidates,
+            ir_state_switch_candidates,
             _fallback_lookup_candidates,
             _callee_success_candidates,
+            ir_lookup_candidates,
         ),
+        function_ir,
     )
 
 
@@ -731,10 +816,10 @@ def _bodygen_ops() -> BodyGenOps:
         _needs_len_data_shape,
         _append_len_data_shape,
         _param_ref_from_arg,
-        _function_frees_param,
-        _function_takes_param_ownership,
-        _function_accepts_null_param,
-        _function_returns_owned_pointer,
+        _fallback_function_frees_param,
+        _fallback_function_takes_param_ownership,
+        _fallback_function_accepts_null_param,
+        _fallback_function_returns_owned_pointer,
         _lookup_free_fn,
         _assumption_setup_lines,
         _source_for_branch_shaping,
@@ -759,6 +844,7 @@ def _gen_null_setup_body(
     type_catalog: CTypeCatalog | None = None,
     function_decls: dict[str, CFunction] | None = None,
     shaping_features: set[str] | None = None,
+    function_ir = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     return _bodygen_gen_null_setup_body(
         func,
@@ -769,6 +855,7 @@ def _gen_null_setup_body(
         function_decls,
         shaping_features,
         _bodygen_ops(),
+        _ownership_summary_from_ir(func, function_ir),
     )
 
 
@@ -831,6 +918,11 @@ def _gen_valid_setup_body(
     shaping_features: set[str] | None = None,
     source_shape_oracle: bool = False,
     source_shape_witnesses: bool = False,
+    function_ir = None,
+    object_paths = None,
+    call_arg_overrides = None,
+    witness_setup = None,
+    extra_outputs = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     return _bodygen_gen_valid_setup_body(
         func,
@@ -844,6 +936,11 @@ def _gen_valid_setup_body(
         source_shape_oracle,
         source_shape_witnesses,
         _bodygen_ops(),
+        _ownership_summary_from_ir(func, function_ir),
+        object_paths,
+        call_arg_overrides,
+        witness_setup,
+        extra_outputs,
     )
 
 
@@ -854,6 +951,7 @@ def _gen_mixed_test(
     type_catalog: CTypeCatalog | None = None,
     function_decls: dict[str, CFunction] | None = None,
     shaping_features: set[str] | None = None,
+    function_ir = None,
 ) -> tuple[list[str], list[str], list[str], list[str]]:
     return _bodygen_gen_mixed_test(
         func,
@@ -863,5 +961,5 @@ def _gen_mixed_test(
         function_decls,
         shaping_features,
         _bodygen_ops(),
+        _ownership_summary_from_ir(func, function_ir),
     )
-

@@ -11,16 +11,16 @@ Two special pseudo-statements let one list of body lines serve both
 the probe driver and the unit test file:
 
     __GUARD__(expr)
-        probe : if (!ptr) return;
+        probe : Frama_C_assume(ptr != 0);
         unit  : assert(ptr != NULL);
 
     For a non-variable expression such as __GUARD__(ret == 0), the expression is
     used directly:
-        probe : if (!(ret == 0)) return;
+        probe : Frama_C_assume(ret == 0);
         unit  : assert(ret == 0);
 
     __GUARD_WITH_CLEANUP__(ptr, cleanup_stmt)
-        probe : if (!ptr) { cleanup_stmt; return; }
+        probe : Frama_C_assume(ptr != 0);
         unit  : assert(ptr != NULL);       (cleanup_stmt is not emitted in unit)
 
 This avoids duplicating the setup logic between probe and unit functions.
@@ -40,6 +40,11 @@ class Recipe:
     outputs:    list[str]    # local variable names EVA should prove as singletons
     preamble:   list[str] = field(default_factory=list)  # top-level C before the test fn
     candidate:  bool = False  # optional generated recipe; skip if EVA cannot prove all outputs
+    ktest_path: str | None = None  # concrete KLEE artifact used to build this recipe
+    source_location: str | None = None
+    target_branch:   str | None = None
+    candidate_origin: str | None = None
+    candidate_facts: list[dict[str, str]] = field(default_factory=list)
 
 
 # ── guard marker regex patterns ───────────────────────────────────────────────
@@ -63,10 +68,10 @@ def expand_guard(line: str, *, is_probe: bool, is_klee: bool = False) -> str:
         if not _is_identifier(v):
             if is_klee:
                 return f"if (!({v})) return 0;"
-            return f"if (!({v})) return;" if is_probe else f"assert({v});"
+            return f"Frama_C_assume({v});" if is_probe else f"assert({v});"
         if is_klee:
             return f"if (!{v}) return 0;"
-        return f"if (!{v}) return;" if is_probe else f"assert({v} != NULL);"
+        return f"Frama_C_assume({v} != 0);" if is_probe else f"assert({v} != NULL);"
 
     m = _GUARD_CLEANUP_RE.match(line)
     if m:
@@ -74,7 +79,7 @@ def expand_guard(line: str, *, is_probe: bool, is_klee: bool = False) -> str:
         if is_klee:
             return f"if (!{v}) {{ {cl}; return 0; }}"
         return (
-            f"if (!{v}) {{ {cl}; return; }}"
+            f"Frama_C_assume({v} != 0);"
             if is_probe
             else f"assert({v} != NULL);"
         )

@@ -154,6 +154,50 @@ Then run it:
 kleva all kleva/module_augmented.yaml --base-dir .
 ```
 
+## Helper Call Repair Rules
+
+Helper call repair rules shape candidates around guarded helper calls discovered
+from the C AST, such as:
+
+```c
+if (verify(input) != 0) return -1;
+```
+
+Use them when KLEVA finds the branch but needs explicit setup to make the helper
+call pass or fail:
+
+```yaml
+helper_call_rules:
+  - callee: verify
+    success_setup:
+      - "{arg0}->value = 1;"
+    failure_setup:
+      - "{arg0}->value = 0;"
+```
+
+Run with helper rules:
+
+```sh
+kleva run module.h \
+  --source module.c \
+  --include . \
+  --helper-rules helper-rules.yaml \
+  --mode all \
+  --base-dir .
+```
+
+Or synthesize a YAML plan with helper rules:
+
+```sh
+kleva synth module.h \
+  --source module.c \
+  --include . \
+  --helper-rules helper-rules.yaml \
+  --out kleva/module.yaml
+```
+
+More detail: [helper-call-rules.md](helper-call-rules.md).
+
 ## Shaping Features
 
 `kleva synth` and `kleva run` support branch/input shaping features.
@@ -172,13 +216,65 @@ kleva run module.h --source module.c --include . --no-shaping function-pointers 
 
 Current shapers:
 
+- `branch-conditions`
 - `byte-order`
+- `callee-success`
 - `casted-fields`
+- `fallback-lookups`
 - `function-pointers`
 - `loop-tables`
+- `parser-headers`
+- `regex-fallbacks`
 - `quantified-arrays`
+- `state-switches`
 
 Use `--shaping none` to turn shaping off.
+
+By default, KLEVA enables the AST/IR shapers and leaves
+`regex-fallbacks` off. Use `--shaping all` or explicitly include
+`--shaping regex-fallbacks` when you need the older text/regex fallback
+shapers for compatibility.
+
+Generated plans include a header comment such as `# Fallbacks: none` or
+`# Fallbacks: used`. When fallback is used because IR is disabled, IR
+extraction failed, or `regex-fallbacks` was requested, `kleva synth` also prints
+a warning and records the reason in `--ir-diagnostics` output.
+
+## Coverage Candidate Report
+
+KLEVA can render an external coverage-fact file as a candidate report:
+
+```sh
+kleva coverage-report coverage-facts.yaml --out coverage-report.md
+```
+
+The command is report-only. It does not run gcov/gcovr and does not feed
+coverage back into synthesis.
+
+The report also includes a conservative `Regex Fallback Retirement` section.
+It reports `ready` only when all mapped candidates are IR-origin, proven, and
+covered, with no unknown-origin candidates and no uncovered branch without a
+candidate.
+
+Input shape:
+
+```yaml
+candidates:
+  - name: case_open
+    source_location: src/run.c:42:5
+    target_branch: switch ctx->state case 1
+    proven: true
+    origin: ir
+    candidate_facts:
+      - kind: branch
+        target: ctx->state
+        relation: case
+        value: "1"
+branches:
+  - source_location: src/run.c:42:5
+    target_branch: switch ctx->state case 1
+    covered: true
+```
 
 ## Output Files
 
@@ -190,4 +286,3 @@ By default, generated artifacts use paths from the synthesized plan:
 - Unit test: `unit/test_<module>_kleva.c`
 
 `--base-dir` controls where those relative paths are resolved.
-

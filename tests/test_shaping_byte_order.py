@@ -2,7 +2,7 @@ import unittest
 
 from kleva.ast.model import CFunction, CParam, CTypeCatalog
 from kleva.shaping.byte_order import decoded_field_aliases, host_to_network_fn
-from kleva.shaping.candidates import BranchCandidate
+from kleva.shaping.candidates import BranchCandidate, BranchFact, CallOutcomeFact, PostStateFact
 
 
 class ByteOrderShapingTests(unittest.TestCase):
@@ -40,14 +40,29 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(cb_param.name, "arg0")
 
     def test_candidate_and_function_models_are_typed_containers(self):
-        candidate = BranchCandidate("source_case", ["x = 1;"], witness_outputs=True)
+        branch_fact = BranchFact("x", "==", "1")
+        call_fact = CallOutcomeFact("prepare", "equals_-1", "success")
+        post_fact = PostStateFact("ctx->ready", "!=", "0")
+        candidate = BranchCandidate(
+            "source_case",
+            ["x = 1;"],
+            witness_outputs=True,
+            branch_facts=[branch_fact],
+            call_facts=[call_fact],
+            post_state_facts=[post_fact],
+        )
         func = CFunction("f", "int", "int", False, [])
 
         self.assertEqual(candidate.name, "source_case")
         self.assertTrue(candidate.witness_outputs)
+        self.assertEqual(candidate.semantic_facts(), (branch_fact, call_fact, post_fact))
+        self.assertEqual(candidate.semantic_fact_dicts(), [
+            {"kind": "branch", "target": "x", "relation": "==", "value": "1"},
+            {"kind": "call", "callee": "prepare", "mode": "equals_-1", "outcome": "success"},
+            {"kind": "post_state", "target": "ctx->ready", "relation": "!=", "value": "0"},
+        ])
         self.assertEqual(func.return_base, "int")
 
 
 if __name__ == "__main__":
     unittest.main()
-

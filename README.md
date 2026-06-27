@@ -56,10 +56,10 @@ codebase, so some projects will expose gaps in what it can synthesize or prove.
 Feedback and small reproducible examples are welcome.
 
 KLEVA has been tested on
-[PhosphorFrame](https://github.com/EhsunHighway/PhosphorFrame), a C network
+[FrameRunner](https://github.com/EhsunHighway/FrameRunner), a C network
 simulator that models packet flow through Ethernet, ARP, IP, transport
 protocols, routing, devices, links, and events. If you want to see realistic
-ACSL annotations for KLEVA, PhosphorFrame is a good example project to study.
+ACSL annotations for KLEVA, FrameRunner is a good example project to study.
 
 ## Requirements
 
@@ -287,11 +287,45 @@ kleva augment kleva/module.yaml \
 Augment rules are data, not Python plugins. KLEVA core should stay generic;
 project-specific setup belongs in user rule files.
 
+## Helper Call Repair Rules
+
+KLEVA can also use helper-call repair rules during `kleva synth` or `kleva run`.
+These rules shape candidates around guarded helper calls discovered from the C
+AST:
+
+```c
+if (verify(input) != 0) return -1;
+```
+
+Example rule:
+
+```yaml
+helper_call_rules:
+  - callee: verify
+    success_setup:
+      - "{arg0}->value = 1;"
+    failure_setup:
+      - "{arg0}->value = 0;"
+```
+
+Use it with:
+
+```sh
+kleva run module.h \
+  --source module.c \
+  --include . \
+  --helper-rules helper-rules.yaml \
+  --mode all \
+  --base-dir .
+```
+
+More detail: [docs/helper-call-rules.md](docs/helper-call-rules.md).
+
 ## Command Summary
 
 ```sh
-kleva synth   module.h [--source module.c] [--include DIR] [--out FILE]
-kleva run     module.h [--source module.c] [--include DIR] [--mode all]
+kleva synth   module.h [--source module.c] [--include DIR] [--helper-rules FILE] [--out FILE]
+kleva run     module.h [--source module.c] [--include DIR] [--helper-rules FILE] [--mode all]
 kleva augment module.yaml [--rules rules.yaml] [--out FILE]
 kleva klee    module.yaml --base-dir .
 kleva gen     module.yaml --base-dir .
@@ -305,4 +339,5 @@ Every command supports `-h`, `--help`, and `-help`.
 
 - [docs/usage.md](docs/usage.md)
 - [docs/augment-rules.md](docs/augment-rules.md)
+- [docs/helper-call-rules.md](docs/helper-call-rules.md)
 - [docs/modules.md](docs/modules.md)

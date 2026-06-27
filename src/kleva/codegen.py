@@ -7,7 +7,7 @@ Two outputs
     • One static void probe_<fn_id>(void) per Recipe.
     • Concrete inputs only — no //@ assert annotations.
     • Frama-C EVA abstract-interprets this to produce singleton output values.
-    • __GUARD__ markers expand to early-return guards (if (!p) return;).
+    • __GUARD__ markers expand to Frama_C_assume() fixture assumptions.
 
   Unit test file  (unit/test_gen.c)
     • One static void test_<fn_id>(void) per Recipe.
@@ -21,11 +21,24 @@ Two outputs
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from .config import FunctionSpec, InputSpec
 from .recipe import Recipe, expand_guard
+
+
+@dataclass(frozen=True)
+class UnprovedClassification:
+    category: str
+    note:     str
+
+
+@dataclass(frozen=True)
+class KleeDiagnostic:
+    status:   str
+    artifact: str
 
 
 # ── file headers ──────────────────────────────────────────────────────────────
@@ -39,6 +52,8 @@ _PROBE_HEADER = """\
 #include <stdint.h>
 #include <string.h>
 #include "{header}"
+
+void Frama_C_assume(int condition);
 
 """
 
@@ -88,13 +103,23 @@ _KLEE_HEADER = """\
 
 # ── per-function generators ───────────────────────────────────────────────────
 
+def _drop_local_typedefs(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("typedef "):
+            continue
+        out.append(line)
+    return out
+
+
 def _probe_fn(recipe: Recipe) -> tuple[str, str]:
     """Return (C source, function name) for one probe function."""
     fn    = "probe_" + recipe.fn_id
     lines = [f"static void {fn}(void) {{"]
     for line in recipe.decl_lines:
         lines.append("    " + line)
-    for line in recipe.body_lines:
+    for line in _drop_local_typedefs(recipe.body_lines):
         lines.append("    " + expand_guard(line, is_probe=True))
     # EVA probes exist only to harvest singleton values at the end of the
     # wrapper. Cleanup can free or mutate objects referenced by output vars,
@@ -118,7 +143,7 @@ def _unit_fn(
     lines = [f"static void {fn}(void) {{"]
     for line in recipe.decl_lines:
         lines.append("    " + line)
-    for line in recipe.body_lines:
+    for line in _drop_local_typedefs(recipe.body_lines):
         lines.append("    " + expand_guard(line, is_probe=False))
 
     for var in recipe.outputs:
@@ -151,17 +176,27 @@ def _diagnostic_unit_fn(
     bug.
     """
     fn = "test_" + recipe.fn_id
+    classification = _classify_unproved(recipe, singletons, unproven)
+    klee_diag = _klee_diagnostic(recipe)
     lines = [
         f"/*",
         f" * KLEVA diagnostic candidate: {recipe.fn_id}",
         f" * Status: EVA_UNPROVED",
+        f" * KLEE status: {klee_diag.status}",
+        f" * KLEE artifact: {klee_diag.artifact}",
+        f" * Source location: {_diagnostic_value(recipe.source_location)}",
+        f" * Target branch: {_diagnostic_value(recipe.target_branch)}",
+        f" * Candidate origin: {_diagnostic_value(recipe.candidate_origin)}",
+        f" * Candidate facts: {_diagnostic_facts(recipe.candidate_facts)}",
         f" * Missing singleton output(s): {', '.join(unproven)}",
+        f" * Reason category: {classification.category}",
+        f" * Reason note: {classification.note}",
         f" */",
         f"static void {fn}(void) {{",
     ]
     for line in recipe.decl_lines:
         lines.append("    " + line)
-    for line in recipe.body_lines:
+    for line in _drop_local_typedefs(recipe.body_lines):
         lines.append("    " + expand_guard(line, is_probe=False))
 
     for var in recipe.outputs:
@@ -177,6 +212,90 @@ def _diagnostic_unit_fn(
     lines.append(f'    printf("DIAG {fn}\\n");')
     lines.append("}")
     return "\n".join(lines), fn
+
+
+def _klee_diagnostic(recipe: Recipe) -> KleeDiagnostic:
+    if recipe.ktest_path:
+        return KleeDiagnostic("ktest_available", recipe.ktest_path)
+    return KleeDiagnostic("not_recorded", "not_recorded")
+
+
+def _diagnostic_value(value: str | None) -> str:
+    return value if value else "not_recorded"
+
+
+def _diagnostic_facts(facts: list[dict[str, str]]) -> str:
+    if not facts:
+        return "not_recorded"
+    rendered: list[str] = []
+    for fact in facts:
+        if fact.get("kind") == "branch":
+            rendered.append(
+                f"branch:{fact.get('target', '?')} {fact.get('relation', '?')} {fact.get('value', '?')}"
+            )
+        elif fact.get("kind") == "call":
+            rendered.append(
+                f"call:{fact.get('callee', '?')} {fact.get('mode', '?')} {fact.get('outcome', '?')}"
+            )
+        elif fact.get("kind") == "post_state":
+            rendered.append(
+                f"post:{fact.get('target', '?')} {fact.get('relation', '?')} {fact.get('value', '?')}"
+            )
+        else:
+            rendered.append(str(fact))
+    return "; ".join(rendered)
+
+
+def _classify_unproved(
+    recipe:     Recipe,
+    singletons: dict[str, int],
+    unproven:   list[str],
+) -> UnprovedClassification:
+    text = "\n".join([*recipe.decl_lines, *recipe.body_lines, *recipe.cleanup, *recipe.preamble])
+    lower = text.lower()
+
+    if "kleva synth:" in lower or "no visible allocation strategy" in lower or "using null" in lower:
+        return UnprovedClassification(
+            "fixture_gap",
+            "generated setup contains a visible fixture fallback or missing allocation strategy",
+        )
+
+    missing_assignments = [
+        var for var in unproven
+        if not _looks_assigned_or_declared(var, recipe)
+    ]
+    if missing_assignments:
+        return UnprovedClassification(
+            "missing_contract_or_observable",
+            f"requested output is not visibly assigned or declared in the generated probe: {', '.join(missing_assignments)}",
+        )
+
+    if singletons:
+        return UnprovedClassification(
+            "eva_imprecision",
+            "EVA proved some requested outputs but not all, suggesting a precision or path-splitting gap",
+        )
+
+    if any(var in {"out_ret", "ret", "result"} or var.endswith("_ret") for var in unproven):
+        return UnprovedClassification(
+            "possible_implementation_bug",
+            "return-value output stayed unproved for this concrete candidate; review the path for missing setup or unexpected behavior",
+        )
+
+    return UnprovedClassification(
+        "eva_imprecision_or_missing_contract",
+        "no specific fixture or observable-shape issue was detected from the generated recipe",
+    )
+
+
+def _looks_assigned_or_declared(var: str, recipe: Recipe) -> bool:
+    text = "\n".join([*recipe.decl_lines, *recipe.body_lines])
+    return (
+        f" {var} " in text
+        or f" {var}=" in text
+        or f" {var} =" in text
+        or text.strip().startswith(f"{var} ")
+    )
 
 
 # ── file writers ──────────────────────────────────────────────────────────────
@@ -305,8 +424,16 @@ def write_unit_tests(
             if r.candidate:
                 total_unproven += len(unproven)
                 if emit_unproved in {"report", "tests", "all"}:
+                    classification = _classify_unproved(r, singletons, unproven)
+                    klee_diag = _klee_diagnostic(r)
                     report_lines.append(
-                        f"- {r.fn_id}: EVA_UNPROVED missing={', '.join(unproven)}"
+                        f"- {r.fn_id}: EVA_UNPROVED missing={', '.join(unproven)} "
+                        f"klee_status={klee_diag.status} klee_artifact={klee_diag.artifact} "
+                        f"source_location={_diagnostic_value(r.source_location)} "
+                        f"target_branch={_diagnostic_value(r.target_branch)} "
+                        f"candidate_origin={_diagnostic_value(r.candidate_origin)} "
+                        f"candidate_facts={_diagnostic_facts(r.candidate_facts)} "
+                        f"reason={classification.category} note={classification.note}"
                     )
                 if emit_unproved in {"tests", "all"}:
                     diag_body, diag_fn = _diagnostic_unit_fn(r, singletons, unproven)
@@ -443,7 +570,7 @@ def write_klee_harness(
     lines.append("")
     lines.append("    /* --- call sequence --- */")
 
-    for line in spec.body:
+    for line in _drop_local_typedefs(spec.body):
         lines.append("    " + expand_guard(line, is_probe=True, is_klee=True))
     for line in spec.cleanup:
         lines.append("    " + line)

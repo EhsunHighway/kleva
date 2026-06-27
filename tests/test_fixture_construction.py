@@ -2,6 +2,7 @@ import unittest
 
 from kleva.ast.model import CFunction, CFunctionPointerTypedef, CParam, CTypeCatalog
 from kleva.fixtures.construction import (
+    complete_struct_setup,
     default_scalar_value,
     forward_typedefs_for_function,
     function_prototype,
@@ -26,11 +27,13 @@ class FixtureConstructionTests(unittest.TestCase):
 
     def test_lookup_constructor_and_free_use_visible_generic_naming(self):
         ctor = CFunction("widget_create", "Widget *", "Widget", True, [])
-        decls = {"widget_create": ctor}
+        free = CFunction("widget_free", "void", "void", False, [])
+        decls = {"widget_create": ctor, "widget_free": free}
         source = "void widget_free(Widget *w) { (void)w; }"
 
         self.assertIs(lookup_constructor("Widget", decls), ctor)
         self.assertEqual(lookup_free_fn("Widget", source), "widget_free")
+        self.assertEqual(lookup_free_fn("Widget", None, decls), "widget_free")
 
     def test_default_scalar_value_uses_common_shape_hints(self):
         self.assertEqual(default_scalar_value(_param("length", "uint16_t", "uint16_t")), "1")
@@ -68,6 +71,47 @@ class FixtureConstructionTests(unittest.TestCase):
         self.assertEqual(arg, "&widget")
         self.assertEqual(cleanup, [])
 
+    def test_complete_struct_setup_shapes_struct_and_pointer_arrays(self):
+        catalog = CTypeCatalog(
+            complete_structs={"Owner", "Item", "Slot"},
+            struct_fields={
+                "Owner": {
+                    "items": _param("items", "Item items[4]", "Item", False, True, 4),
+                    "slots": _param("slots", "Slot *slots[4]", "Slot", True, True, 4),
+                },
+                "Item": {},
+                "Slot": {},
+            },
+        )
+
+        setup = complete_struct_setup("Owner", "owner", catalog, set())
+
+        self.assertIn("Item owner_items_0;", setup)
+        self.assertIn("owner.items[0] = owner_items_0;", setup)
+        self.assertIn("Slot owner_slots_0;", setup)
+        self.assertIn("owner.slots[0] = &owner_slots_0;", setup)
+
+    def test_complete_struct_setup_can_follow_only_required_paths(self):
+        catalog = CTypeCatalog(
+            complete_structs={"Widget", "Queue", "Store"},
+            struct_fields={
+                "Widget": {
+                    "queue": _param("queue", "Queue *queue", "Queue", True),
+                    "store": _param("store", "Store *store", "Store", True),
+                },
+                "Queue": {},
+                "Store": {},
+            },
+        )
+
+        setup = complete_struct_setup("Widget", "widget", catalog, set(), required_paths=[("queue", "size")])
+
+        self.assertIn("Widget widget;", setup)
+        self.assertIn("Queue widget_queue;", setup)
+        self.assertIn("widget.queue = &widget_queue;", setup)
+        self.assertNotIn("Store widget_store;", setup)
+        self.assertNotIn("widget.store = &widget_store;", setup)
+
     def test_pointer_argument_setup_uses_visible_constructor_and_cleanup(self):
         ctor = CFunction(
             "widget_create",
@@ -87,6 +131,38 @@ class FixtureConstructionTests(unittest.TestCase):
         self.assertIn("Widget *widget = widget_create(64);", setup)
         self.assertEqual(arg, "widget")
         self.assertEqual(cleanup, ["widget_free(widget);"])
+
+    def test_pointer_argument_setup_prefers_constructor_for_complete_struct(self):
+        catalog = CTypeCatalog(
+            complete_structs={"Queue", "Item"},
+            struct_fields={
+                "Queue": {
+                    "items": _param("items", "Item **items", "Item", True),
+                    "count": _param("count", "size_t count", "size_t"),
+                    "capacity": _param("capacity", "size_t capacity", "size_t"),
+                },
+                "Item": {},
+            },
+        )
+        ctor = CFunction(
+            "queue_create",
+            "Queue *",
+            "Queue",
+            True,
+            [_param("capacity", "size_t capacity", "size_t")],
+        )
+
+        setup, arg, cleanup = pointer_argument_setup(
+            _param("queue", "Queue *queue", "Queue", True),
+            type_catalog=catalog,
+            function_decls={"queue_create": ctor},
+        )
+
+        self.assertIn("Queue * queue_create(size_t capacity);", setup)
+        self.assertIn("Queue *queue = queue_create(64);", setup)
+        self.assertNotIn("Queue queue;", setup)
+        self.assertEqual(arg, "queue")
+        self.assertEqual(cleanup, [])
 
     def test_function_prototype_preserves_declared_param_shapes(self):
         decl = CFunction(

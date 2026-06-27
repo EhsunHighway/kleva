@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..ast.model import CTypeCatalog
-from .candidates import BranchCandidate
+from .candidates import BranchCandidate, CallOutcomeFact
 from .conditions import split_conjuncts, strip_outer_parens
 
 
@@ -63,6 +63,53 @@ def invert_simple_return_guard(
     parts = [strip_outer_parens(p) for p in split_conjuncts(condition)]
 
     for part in parts:
+        m = re.fullmatch(r"!\s*([A-Za-z_]\w*)", part)
+        if m:
+            local = m.group(1)
+            if local in visible_roots:
+                append_unique(setup, f"{local} = 1;", seen)
+            continue
+
+        m = re.fullmatch(r"([A-Za-z_]\w*)", part)
+        if m:
+            local = m.group(1)
+            if local in visible_roots:
+                append_unique(setup, f"{local} = 0;", seen)
+            continue
+
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
+        if m:
+            local, rhs = m.groups()
+            if local in visible_roots:
+                append_unique(setup, f"{local} = {rhs};", seen)
+            continue
+
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*==\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
+        if m:
+            local, rhs = m.groups()
+            if local in visible_roots:
+                append_unique(setup, f"{local} = {nonmatching_value(rhs)};", seen)
+            continue
+
+        m = re.fullmatch(
+            r"([A-Za-z_]\w*)\s*(<|<=|>|>=)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+            part,
+        )
+        if m:
+            local, op, rhs = m.groups()
+            if local not in visible_roots:
+                continue
+            if op == "<":
+                value = rhs
+            elif op == "<=":
+                value = f"(({rhs}) + 1)"
+            elif op == ">":
+                value = rhs
+            else:
+                value = f"(({rhs}) > 0 ? ({rhs}) - 1 : 0)"
+            append_unique(setup, f"{local} = {value};", seen)
+            continue
+
         m = re.fullmatch(r"([A-Za-z_]\w*)->([A-Za-z_]\w*)\s*!=\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)", part)
         if m:
             obj, field, rhs = m.groups()
@@ -261,6 +308,8 @@ def callee_success_candidates(
             [*guard_setup, *setup],
             preamble,
             witness_outputs=True,
+            origin="regex",
+            call_facts=[CallOutcomeFact(callee, "equals_-1", "success")],
         ))
 
     for m in patterns[1].finditer(body):
@@ -281,6 +330,8 @@ def callee_success_candidates(
             [*guard_setup, *setup],
             preamble,
             witness_outputs=True,
+            origin="regex",
+            call_facts=[CallOutcomeFact(callee, "equals_-1", "success")],
         ))
 
     return candidates

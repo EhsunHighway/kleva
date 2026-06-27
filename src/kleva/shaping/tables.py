@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..ast.model import CTypeCatalog, DerivedLocal
-from .candidates import BranchCandidate
+from .candidates import BranchCandidate, BranchFact
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,14 @@ def loop_table_candidates(
                 ops.safe_c_name(f"source_{alias}_{array_field}_match"),
                 setup,
                 preamble,
+                origin="regex",
+                branch_facts=[
+                    BranchFact(
+                        f"(({cast_type} *){expr})->{container_field}->{array_field}[0].{match_field_b}",
+                        "==",
+                        match_value_b,
+                    ),
+                ],
             ))
 
             miss_setup = list(good_setup)
@@ -116,6 +124,14 @@ def loop_table_candidates(
                 ops.safe_c_name(f"source_{alias}_{array_field}_miss"),
                 miss_setup,
                 [],
+                origin="regex",
+                branch_facts=[
+                    BranchFact(
+                        f"(({cast_type} *){expr})->{container_field}->{array_field}[0].{match_field_a}",
+                        "==",
+                        "0",
+                    ),
+                ],
             ))
 
     return candidates

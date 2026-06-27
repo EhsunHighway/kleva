@@ -1,6 +1,7 @@
 import unittest
 
 from kleva.ast.model import CFunctionPointerTypedef, CParam, CTypeCatalog
+from kleva.shaping.candidates import BranchFact
 from kleva.shaping.tables import TableShapeOps, loop_table_candidates
 
 
@@ -74,10 +75,16 @@ class TableShapingTests(unittest.TestCase):
         self.assertIn("((Context *)ctx_arg)->table->entries[0].id = wanted;", match.setup)
         self.assertIn("((Context *)ctx_arg)->table->entries[0].handler = stub_RecvFn;", match.setup)
         self.assertEqual(match.preamble, ["static void stub_RecvFn(void) {}"])
+        self.assertEqual(match.branch_facts, [
+            BranchFact("((Context *)ctx_arg)->table->entries[0].id", "==", "wanted"),
+        ])
 
         miss = candidates[1]
         self.assertIn("((Context *)ctx_arg)->table->entries[0].valid = 0;", miss.setup)
         self.assertEqual(miss.preamble, [])
+        self.assertEqual(miss.branch_facts, [
+            BranchFact("((Context *)ctx_arg)->table->entries[0].valid", "==", "0"),
+        ])
 
     def test_loop_table_candidates_can_map_decoded_match_values_back_to_storage(self):
         catalog = CTypeCatalog(

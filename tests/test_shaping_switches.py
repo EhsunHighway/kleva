@@ -1,6 +1,7 @@
 import unittest
 
 from kleva.ast.model import CTypeCatalog
+from kleva.shaping.candidates import BranchFact
 from kleva.shaping.lookups import LookupShape
 from kleva.shaping.switches import StateSwitchOps, state_switch_candidates, switch_case_blocks
 
@@ -56,7 +57,6 @@ class SwitchShapingTests(unittest.TestCase):
             lambda expr, _aliases: expr,
             lambda cond, *_args: [f"/* shaped {cond.strip()} */"],
             lambda *_args: ([], []),
-            lambda *_args: ([], []),
             lambda line, *_args: line,
             lambda name: name,
         )
@@ -79,6 +79,9 @@ class SwitchShapingTests(unittest.TestCase):
         self.assertIn("source_item_state_INIT_guard_1", names)
         init = next(candidate for candidate in candidates if candidate.name == "source_item_state_INIT")
         self.assertIn("table->items[0].state = INIT;", init.setup)
+        self.assertEqual(init.branch_facts, [
+            BranchFact("table->items[0].state", "case", "INIT"),
+        ])
 
 
 if __name__ == "__main__":

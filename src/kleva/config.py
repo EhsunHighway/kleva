@@ -185,6 +185,10 @@ class FunctionSpec:
     pure:      bool = False    # no heap → schedule before heap functions in EVA main()
     preamble:  list[str] = field(default_factory=list)  # top-level C declarations before main()
     candidate: bool = False    # optional generated path; only emitted if EVA proves all outputs
+    source_location: str | None = None
+    target_branch:   str | None = None
+    candidate_origin: str | None = None
+    candidate_facts: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -273,6 +277,13 @@ def _config_from_data(data: dict[str, Any]) -> ModuleConfig:
             pure      = fn_data.get("pure",     False),
             preamble  = fn_data.get("preamble", []),
             candidate = fn_data.get("candidate", False),
+            source_location = fn_data.get("source_location"),
+            target_branch   = fn_data.get("target_branch"),
+            candidate_origin = fn_data.get("candidate_origin"),
+            candidate_facts = [
+                {str(k): str(v) for k, v in fact.items()}
+                for fact in fn_data.get("candidate_facts", [])
+            ],
         ))
 
     return cfg

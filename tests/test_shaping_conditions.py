@@ -1,11 +1,7 @@
 import unittest
 
-from kleva.ast.model import CFunctionPointerTypedef, CParam, CTypeCatalog
-from kleva.fixtures.construction import function_pointer_stub_name, function_pointer_stub_preamble
 from kleva.shaping.conditions import (
     ConditionSetupOps,
-    FunctionPointerConditionOps,
-    condition_function_pointer_setup,
     condition_setup_lines,
     rewrite_source_alias_exprs,
     split_conjuncts,
@@ -53,41 +49,6 @@ class ConditionShapingTests(unittest.TestCase):
             rewrite_source_alias_exprs(line, aliases, "item", "table.items[0]"),
             "table.items[0].ready = ((Record *)ctx->data)->value;",
         )
-
-    def test_function_pointer_condition_setup(self):
-        catalog = CTypeCatalog(
-            function_pointers={
-                "RecvFn": CFunctionPointerTypedef(
-                    "RecvFn",
-                    "void",
-                    [CParam("ctx", "void *ctx", "void", True, False, False, 0)],
-                )
-            },
-            struct_fields={
-                "Item": {
-                    "handler": CParam("handler", "RecvFn handler", "RecvFn", False, False, False, 0)
-                }
-            },
-        )
-        ops = FunctionPointerConditionOps(
-            split_conjuncts,
-            strip_outer_parens,
-            _append_unique,
-            function_pointer_stub_preamble,
-            function_pointer_stub_name,
-        )
-
-        setup, preamble = condition_function_pointer_setup(
-            "item->handler",
-            "item",
-            "table.items[0]",
-            "Item",
-            catalog,
-            ops,
-        )
-
-        self.assertEqual(setup, ["table.items[0].handler = kleva_stub_RecvFn;"])
-        self.assertTrue(preamble[0].startswith("static void kleva_stub_RecvFn"))
 
 
 if __name__ == "__main__":

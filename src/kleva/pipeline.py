@@ -28,6 +28,22 @@ from .klee import run_klee_for_function
 from .recipe import Recipe
 
 
+def candidate_recipe_hint(spec: object, recipe_count: int) -> str | None:
+    """
+    Explain why a generated candidate has no recipes.
+
+    Candidate specs created by no-YAML synthesis still need KLEE output before
+    Phase 1 can build recipes from their ktest directory.
+    """
+    if not getattr(spec, "candidate", False) or recipe_count != 0:
+        return None
+    ktest_dir = getattr(spec, "ktest_dir", "")
+    return (
+        "candidate has no recipes; run mode all/klee first or provide KLEE "
+        f"outputs in {ktest_dir}"
+    )
+
+
 def run_klee_phase(
     cfg:      ModuleConfig,
     base_dir: str = ".",
@@ -103,6 +119,8 @@ def run_pipeline(
     for spec in ordered:
         recipes = build_recipes_for_function(spec, ktest_tool, base_dir)
         log(f"  {spec.name}: {len(recipes)} recipe(s)")
+        if hint := candidate_recipe_hint(spec, len(recipes)):
+            log(f"    note: {hint}")
         all_recipes.extend(recipes)
 
     if not all_recipes:

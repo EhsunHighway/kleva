@@ -42,7 +42,8 @@ def parse_param(raw: str, index: int = 0) -> CParam | None:
         return None
 
     is_const = bool(re.search(r"\bconst\b", raw))
-    is_pointer = "*" in raw
+    pointer_depth = raw.count("*")
+    is_pointer = pointer_depth > 0
     is_array = bool(re.search(r"\[\d*\]", raw))
     array_size = 0
     if is_array:
@@ -84,6 +85,7 @@ def parse_param(raw: str, index: int = 0) -> CParam | None:
         is_const=is_const,
         is_array=is_array,
         array_size=array_size,
+        pointer_depth=pointer_depth,
     )
 
 

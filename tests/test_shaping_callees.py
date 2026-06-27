@@ -3,6 +3,7 @@ import unittest
 
 from kleva.ast.model import CFunction, CParam, CTypeCatalog
 from kleva.fixtures.construction import safe_c_name
+from kleva.shaping.candidates import CallOutcomeFact
 from kleva.shaping.callees import (
     CalleeSuccessOps,
     callee_success_candidates,
@@ -31,7 +32,14 @@ def _ops(source_bodies):
                 "int",
                 False,
                 [_param("ctx", "Context *ctx", "Context", True)],
-            )
+            ),
+            "check_size": CFunction(
+                "check_size",
+                "int",
+                "int",
+                False,
+                [_param("size", "int size", "int")],
+            ),
         },
         lambda _source, name: source_bodies.get(name, ""),
         lambda raw: [part.strip() for part in raw.split(",") if part.strip()],
@@ -61,6 +69,20 @@ class CalleeShapingTests(unittest.TestCase):
             ["ctx->state = not_CLOSED;"],
         )
 
+    def test_inverts_scalar_return_guards(self):
+        self.assertEqual(
+            invert_simple_return_guard("!enabled", {"enabled"}, _append_unique, lambda value: "not_" + value),
+            ["enabled = 1;"],
+        )
+        self.assertEqual(
+            invert_simple_return_guard("size == 0", {"size"}, _append_unique, lambda value: "not_" + value),
+            ["size = not_0;"],
+        )
+        self.assertEqual(
+            invert_simple_return_guard("count <= 4", {"count"}, _append_unique, lambda value: "not_" + value),
+            ["count = ((4) + 1);"],
+        )
+
     def test_callee_success_setup_for_call_inverts_callee_guards(self):
         ops = _ops({"prepare": "if (!ctx->ready) return -1; return 0;"})
 
@@ -73,6 +95,20 @@ class CalleeShapingTests(unittest.TestCase):
         )
 
         self.assertEqual(setup, ["context->ready = 1;"])
+        self.assertEqual(preamble, [])
+
+    def test_callee_success_setup_for_call_inverts_scalar_callee_guards(self):
+        ops = _ops({"check_size": "if (size == 0) return -1; return 0;"})
+
+        setup, preamble = callee_success_setup_for_call(
+            "check_size",
+            ["length"],
+            "source",
+            CTypeCatalog(),
+            ops,
+        )
+
+        self.assertEqual(setup, ["length = 1;"])
         self.assertEqual(preamble, [])
 
     def test_callee_success_candidates_include_prior_source_guard(self):
@@ -96,6 +132,9 @@ class CalleeShapingTests(unittest.TestCase):
         self.assertEqual(candidates[0].name, "source_prepare_success")
         self.assertEqual(candidates[0].setup, ["ctx->enabled = 1;", "ctx->ready = 1;"])
         self.assertTrue(candidates[0].witness_outputs)
+        self.assertEqual(candidates[0].call_facts, [
+            CallOutcomeFact("prepare", "equals_-1", "success"),
+        ])
 
 
 if __name__ == "__main__":

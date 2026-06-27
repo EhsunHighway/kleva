@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from ..ast.model import CTypeCatalog, DerivedLocal
+from ..ast.model import DerivedLocal
 
 
 @dataclass(frozen=True)
@@ -13,15 +13,6 @@ class ConditionSetupOps:
     setup_local_value:      Callable[..., list[str]]
     append_unique:          Callable[[list[str], str, set[str]], None]
     nonmatching_value:      Callable[[str], str]
-
-
-@dataclass(frozen=True)
-class FunctionPointerConditionOps:
-    split_conjuncts:                 Callable[[str], list[str]]
-    strip_outer_parens:              Callable[[str], str]
-    append_unique:                   Callable[[list[str], str, set[str]], None]
-    function_pointer_stub_preamble:  Callable[..., list[str]]
-    function_pointer_stub_name:      Callable[[str], str]
 
 
 def split_conjuncts(expr: str) -> list[str]:
@@ -159,45 +150,3 @@ def condition_setup_lines(
             continue
 
     return setup
-
-
-def condition_function_pointer_setup(
-    condition: str,
-    result_var: str,
-    result_expr: str,
-    result_type: str,
-    type_catalog: CTypeCatalog | None,
-    ops: FunctionPointerConditionOps,
-) -> tuple[list[str], list[str]]:
-    """Shape `if (obj->callback)` style guards for function-pointer fields."""
-    if not type_catalog:
-        return [], []
-
-    setup: list[str] = []
-    preamble: list[str] = []
-    seen_setup: set[str] = set()
-    seen_preamble: set[str] = set()
-
-    for raw_part in ops.split_conjuncts(condition):
-        part = ops.strip_outer_parens(raw_part)
-        m = re.fullmatch(rf"{re.escape(result_var)}->([A-Za-z_]\w*)", part)
-        if not m:
-            continue
-
-        field = m.group(1)
-        field_param = type_catalog.field_type(result_type, field)
-        if not field_param:
-            continue
-        fp_decl = type_catalog.function_pointer(field_param.base_type)
-        if not fp_decl:
-            continue
-
-        for line in ops.function_pointer_stub_preamble(fp_decl):
-            ops.append_unique(preamble, line, seen_preamble)
-        ops.append_unique(
-            setup,
-            f"{result_expr}.{field} = {ops.function_pointer_stub_name(fp_decl.name)};",
-            seen_setup,
-        )
-
-    return setup, preamble
