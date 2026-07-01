@@ -62,10 +62,12 @@ def ownership_facts_from_ir(
     func: FunctionIR,
     param_names: set[str],
     consume_callees: set[str] | None = None,
+    helper_ownership: dict[str, dict[int, str]] | None = None,
 ) -> list[OwnershipFact]:
     facts: list[OwnershipFact] = []
     seen: set[OwnershipFact] = set()
     explicit_callees = consume_callees or set()
+    helper_ownership = helper_ownership or {}
 
     def add(fact: OwnershipFact) -> None:
         if fact in seen:
@@ -74,6 +76,17 @@ def ownership_facts_from_ir(
         facts.append(fact)
 
     for stmt in walk_statements(func):
+        for call in _calls_in_stmt(stmt):
+            callee_ownership = helper_ownership.get(call.callee)
+            if not callee_ownership:
+                continue
+            for index, action in callee_ownership.items():
+                if index >= len(call.args):
+                    continue
+                arg = call.args[index]
+                if isinstance(arg, VarRef) and arg.name in param_names:
+                    add(OwnershipFact(arg.name, action, f"{call.callee}[{index}]"))
+
         if isinstance(stmt, ExprStmt) and isinstance(stmt.expr, CallExpr):
             call = stmt.expr
             if not _is_consuming_callee(call.callee, explicit_callees):
@@ -121,8 +134,9 @@ def classify_ownership_from_ir(
     consume_callees: set[str] | None = None,
     allocation_callees: set[str] | None = None,
     void_param_names: set[str] | None = None,
+    helper_ownership: dict[str, dict[int, str]] | None = None,
 ) -> OwnershipSummary:
-    facts = ownership_facts_from_ir(func, param_names, consume_callees)
+    facts = ownership_facts_from_ir(func, param_names, consume_callees, helper_ownership)
     consumed = {fact.param for fact in facts if fact.action == CONSUMED}
     transferred = {fact.param for fact in facts if fact.action == TRANSFERRED}
     behavior = {name: BORROWED for name in param_names}
@@ -167,6 +181,29 @@ def _is_allocating_callee(callee: str, explicit_callees: set[str]) -> bool:
     if callee in explicit_callees:
         return True
     return callee in {"malloc", "calloc", "realloc"} or callee.endswith(("_create", "_new", "_alloc"))
+
+
+def _calls_in_stmt(stmt) -> list[CallExpr]:
+    calls: list[CallExpr] = []
+
+    def visit(expr) -> None:
+        if isinstance(expr, CallExpr):
+            calls.append(expr)
+            for arg in expr.args:
+                visit(arg)
+            return
+        for attr in ("value", "init", "expr", "target", "base", "index", "operand", "left", "right"):
+            child = getattr(expr, attr, None)
+            if child is not None:
+                visit(child)
+        for child in getattr(expr, "args", []) or []:
+            visit(child)
+
+    for attr in ("expr", "value", "init"):
+        expr = getattr(stmt, attr, None)
+        if expr is not None:
+            visit(expr)
+    return calls
 
 
 def _target_text(expr) -> str:

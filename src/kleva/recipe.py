@@ -31,6 +31,24 @@ import re
 from dataclasses import dataclass, field
 
 
+ALLOCATOR_REDIRECT_MACROS: tuple[str, ...] = (
+    "malloc=__kleva_malloc",
+    "calloc=__kleva_calloc",
+    "realloc=__kleva_realloc",
+    "free=__kleva_free",
+)
+
+
+def uses_allocator_control_lines(*groups: list[str]) -> bool:
+    return "__kleva_alloc_fail_on" in "\n".join(line for group in groups for line in group)
+
+
+def allocator_redirect_macros_for_lines(*groups: list[str]) -> list[str]:
+    if not uses_allocator_control_lines(*groups):
+        return []
+    return list(ALLOCATOR_REDIRECT_MACROS)
+
+
 @dataclass
 class Recipe:
     fn_id:      str          # unique suffix, e.g. "create_tv001"
@@ -57,6 +75,29 @@ def _is_identifier(expr: str) -> bool:
     return re.match(r'^[A-Za-z_]\w*$', expr) is not None
 
 
+def _strip_outer_parens(expr: str) -> str:
+    value = expr.strip()
+    while value.startswith("(") and value.endswith(")"):
+        depth = 0
+        balanced_outer = True
+        for index, char in enumerate(value):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(value) - 1:
+                    balanced_outer = False
+                    break
+        if not balanced_outer or depth != 0:
+            break
+        value = value[1:-1].strip()
+    return value
+
+
+def _is_trivially_nonnull(expr: str) -> bool:
+    return _strip_outer_parens(expr).startswith("&")
+
+
 def expand_guard(line: str, *, is_probe: bool, is_klee: bool = False) -> str:
     """
     Expand one __GUARD__ or __GUARD_WITH_CLEANUP__ marker.
@@ -65,6 +106,8 @@ def expand_guard(line: str, *, is_probe: bool, is_klee: bool = False) -> str:
     m = _GUARD_RE.match(line)
     if m:
         v = m.group(1).strip()
+        if _is_trivially_nonnull(v):
+            return "(void)0;"
         if not _is_identifier(v):
             if is_klee:
                 return f"if (!({v})) return 0;"

@@ -8,6 +8,8 @@ cli.py — `kleva` command.
     kleva all    <module.yaml>  [--base-dir DIR]   klee + gen (full pipeline)
     kleva run    <header.h>     [--mode all|klee|gen] [--base-dir DIR]
                                 Synthesize in memory and run without YAML
+    kleva quality-report <path> --out report.md
+                                Summarize generated KLEVA unit-test quality
     kleva coverage-report <facts.yaml> --out report.md
                                 Render report-only candidate coverage facts
     kleva augment <module.yaml> [--source FILE] [--rules FILE]
@@ -22,10 +24,11 @@ from pathlib import Path
 
 from .config import load_config, load_config_text
 from .pipeline import run_klee_phase, run_pipeline
-from .synth import SHAPING_FEATURES, generate_yaml_from_header, run_synth
-from .synth_config import load_helper_call_rules
+from .synth import generate_yaml_from_header, run_synth
+from .synth_config import SHAPING_FEATURES, load_helper_call_rules
 from .augment import augment_yaml_text, run_augment
 from .coverage_report import write_coverage_report
+from .quality_report import write_quality_report
 from .refiner import run_refine
 
 
@@ -70,12 +73,16 @@ def _add_synth_input_args(p: argparse.ArgumentParser) -> None:
                    help=f"disable selected synth shapers from the default set; choices: {shaping_names}")
     p.add_argument("--ir-backend", choices=("clang-json", "off"), default="clang-json",
                    help="source IR backend for synthesis shaping (default: clang-json)")
+    p.add_argument("--preprocess-ir", action="store_true",
+                   help="run clang -E first and extract IR from the preprocessed translation unit")
     p.add_argument("--emit-ir", default=None, metavar="FILE",
                    help="write extracted typed IR JSON for inspection")
     p.add_argument("--ir-diagnostics", default=None, metavar="FILE",
                    help="write controlled IR extraction diagnostics JSON")
     p.add_argument("--helper-rules", action="append", default=None, metavar="FILE",
                    help="YAML helper-call repair rules for IR parser shaping (repeat for multiple)")
+    p.add_argument("--include-static-functions", action="store_true",
+                   help="also target static/internal functions defined in the primary source")
 
 
 def main() -> None:
@@ -164,6 +171,15 @@ def main() -> None:
     p_coverage.add_argument("facts", help="YAML file containing candidates and branches")
     p_coverage.add_argument("--out", "-o", required=True, help="output Markdown report path")
 
+    # ── kleva quality-report ────────────────────────────────────────────────
+    p_quality = sub.add_parser(
+        "quality-report",
+        help="Summarize generated KLEVA unit-test quality",
+    )
+    _add_help_alias(p_quality)
+    p_quality.add_argument("path", help="generated unit test file or directory to scan")
+    p_quality.add_argument("--out", "-o", required=True, help="output Markdown report path")
+
     # ── kleva augment ─────────────────────────────────────────────────────────
     p_augment = sub.add_parser(
         "augment",
@@ -204,6 +220,8 @@ def main() -> None:
             shaping        = args.shaping,
             no_shaping     = args.no_shaping,
             ir_backend     = args.ir_backend,
+            preprocess_ir  = args.preprocess_ir,
+            include_static_functions = args.include_static_functions,
             emit_ir        = args.emit_ir,
             ir_diagnostics = args.ir_diagnostics,
             helper_rules   = args.helper_rules,
@@ -220,6 +238,8 @@ def main() -> None:
             shaping        = args.shaping,
             no_shaping     = args.no_shaping,
             ir_backend     = args.ir_backend,
+            preprocess_ir  = args.preprocess_ir,
+            include_static_functions = args.include_static_functions,
             emit_ir_path   = args.emit_ir,
             ir_diagnostics_path = args.ir_diagnostics,
             helper_call_rules = load_helper_call_rules(args.helper_rules),
@@ -272,6 +292,11 @@ def main() -> None:
     if args.cmd == "coverage-report":
         write_coverage_report(args.facts, args.out)
         print(f"kleva coverage-report: wrote {args.out}", file=sys.stderr)
+        return
+
+    if args.cmd == "quality-report":
+        write_quality_report(args.path, args.out)
+        print(f"kleva quality-report: wrote {args.out}", file=sys.stderr)
         return
 
     config_path = Path(args.config)

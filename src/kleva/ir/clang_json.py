@@ -9,8 +9,10 @@ from typing import Any
 from ..ast.model import CFunction, CFunctionPointerTypedef, CParam, CTypeCatalog
 from .model import (
     BinaryOp,
+    BreakStmt,
     CallExpr,
     CastExpr,
+    ContinueStmt,
     DeclarationStmt,
     Expr,
     ExprStmt,
@@ -58,6 +60,16 @@ def parse_function_decl_map(
 ) -> dict[str, CFunction]:
     ast = _load_ast(source_path, include_dirs, extra_args, clang)
     return function_decl_map_from_ast(ast)
+
+
+def parse_primary_source_function_names(
+    source_path: str | Path,
+    include_dirs: list[str] | None = None,
+    extra_args: list[str] | None = None,
+    clang: str = "clang",
+) -> set[str]:
+    ast = _load_ast(source_path, include_dirs, extra_args, clang)
+    return primary_source_function_names_from_ast(ast)
 
 
 def parse_header_function_decls(
@@ -133,6 +145,8 @@ def function_irs_from_ast(ast: dict[str, Any], source_path: str | Path) -> dict[
             statements: list[Stmt] = []
             for child in node.get("inner", []) or []:
                 _collect_statements(child, statements, source_name)
+            if not statements:
+                continue
             functions[node["name"]] = FunctionIR(node["name"], statements)
     return functions
 
@@ -146,6 +160,21 @@ def function_decl_map_from_ast(ast: dict[str, Any]) -> dict[str, CFunction]:
         if decl is not None:
             functions[decl.name] = decl
     return functions
+
+
+def primary_source_function_names_from_ast(ast: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    for node in _walk(ast):
+        if node.get("kind") != "FunctionDecl" or not node.get("name"):
+            continue
+        if _location_from_included_file(node):
+            continue
+        statements: list[Stmt] = []
+        for child in node.get("inner", []) or []:
+            _collect_statements(child, statements, "")
+        if statements:
+            names.add(node["name"])
+    return names
 
 
 def header_function_decls_from_ast(ast: dict[str, Any], header_path: str | Path) -> list[CFunction]:
@@ -167,6 +196,23 @@ def header_function_decls_from_ast(ast: dict[str, Any], header_path: str | Path)
         seen.add(decl.name)
         functions.append(decl)
     return functions
+
+
+def _location_from_included_file(node: dict[str, Any]) -> bool:
+    loc = node.get("loc")
+    if isinstance(loc, dict) and "includedFrom" in loc:
+        return True
+    begin = (node.get("range") or {}).get("begin")
+    if isinstance(begin, dict):
+        if "includedFrom" in begin:
+            return True
+        spelling = begin.get("spellingLoc")
+        if isinstance(spelling, dict) and "includedFrom" in spelling:
+            return True
+        expansion = begin.get("expansionLoc")
+        if isinstance(expansion, dict) and "includedFrom" in expansion:
+            return True
+    return False
 
 
 def type_catalog_from_ast(ast: dict[str, Any]) -> CTypeCatalog:
@@ -376,9 +422,20 @@ def _collect_statements(node: dict[str, Any], out: list[Stmt], source_path: str 
         children = node.get("inner", []) or []
         if len(children) >= 2:
             out.append(AssignmentStmt(_expr(children[0]), _expr(children[1]), _source_location(node, source_path)))
+    elif kind == "CompoundAssignOperator":
+        children = node.get("inner", []) or []
+        opcode = str(node.get("opcode", ""))
+        if len(children) >= 2 and opcode.endswith("=") and len(opcode) > 1:
+            target = _expr(children[0])
+            value = BinaryOp(opcode[:-1], target, _expr(children[1]), _qual_type(node))
+            out.append(AssignmentStmt(target, value, _source_location(node, source_path)))
     elif kind == "ReturnStmt":
         children = node.get("inner", []) or []
         out.append(ReturnStmt(_expr(children[0]) if children else None, _source_location(node, source_path)))
+    elif kind == "BreakStmt":
+        out.append(BreakStmt(_source_location(node, source_path)))
+    elif kind == "ContinueStmt":
+        out.append(ContinueStmt(_source_location(node, source_path)))
     elif kind in {"ForStmt", "WhileStmt", "DoStmt"}:
         out.append(LoopStmt(_loop_kind(kind), _loop_condition(node), _loop_body(node, source_path), _source_location(node, source_path)))
     elif kind == "SwitchStmt":

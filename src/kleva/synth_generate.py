@@ -1,29 +1,18 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 from .acsl import ACSLBehavior, AcslParser, ScannerAcslParser
-from .ast.model import CTypeCatalog
-from .compat.source_fallbacks import fallback_build_type_catalog as _fallback_build_type_catalog
-from .compat.source_fallbacks import fallback_function_accepts_null_param as _fallback_function_accepts_null_param
-from .compat.source_fallbacks import fallback_function_decl_map as _fallback_function_decl_map
-from .compat.source_fallbacks import fallback_parse_header as _fallback_parse_header
 from .config import resolve_klee_clang, resolve_klee_include, resolve_llvm_link
-from .ir.clang_json import parse_header_function_decls as _parse_header_function_decls
-from .ir.clang_json import parse_translation_unit_with_decls_and_types as _parse_ir_translation_unit_with_decls_and_types
-from .ir.diagnostics import IrDiagnostic, write_ir_diagnostics as _write_ir_diagnostics
+from .ir.diagnostics import write_ir_diagnostics as _write_ir_diagnostics
 from .ir.serialize import write_ir_json as _write_ir_json
-from .shaping.ir_nullability import accepts_null_param_from_ir as _ir_accepts_null_param
-from .source_discovery import (
-    collect_source_include_headers as _collect_source_include_headers,
-    collect_visible_headers as _collect_visible_headers,
-    dedupe_paths as _dedupe_paths,
-    source_include_names as _source_include_names,
-    suggest_extra_sources as _suggest_extra_sources,
-)
+from .kernel import ProgramInput, ProgramModel, build_program_model
+from .shaping.diversity import curated_diversity_candidates
 from .shaping.ir_parsers import HelperCallRule
-from .synth_config import normalize_shaping_features
+from .shaping.reducer import reduce_branch_candidates
+from .synth_config import SCALAR_BOUNDS, normalize_shaping_features
 from .synth_ops import (
     _extract_non_null_params,
     _extract_null_params,
@@ -39,21 +28,38 @@ from .yaml_emit import emit_yaml_function as _emit_yaml_function
 
 # ── Main generator ────────────────────────────────────────────────────────────
 
+def _has_exact_scalar_assumption(assumes: list[str]) -> bool:
+    for expr in assumes:
+        for part in re.split(r"\|\||&&", expr):
+            part = part.strip()
+            if re.fullmatch(r"[A-Za-z_]\w*\s*==\s*(?:0x[0-9a-fA-F]+|-?\d+)", part):
+                return True
+            if re.fullmatch(r"(?:0x[0-9a-fA-F]+|-?\d+)\s*==\s*[A-Za-z_]\w*", part):
+                return True
+    return False
 
-def _merge_type_catalogs(fallback: CTypeCatalog, preferred: CTypeCatalog) -> CTypeCatalog:
-    merged = CTypeCatalog(
-        complete_structs=set(fallback.complete_structs),
-        opaque_structs=set(fallback.opaque_structs),
-        function_pointers=dict(fallback.function_pointers),
-        struct_fields={name: dict(fields) for name, fields in fallback.struct_fields.items()},
+
+def _looks_like_failure_behavior(behavior: ACSLBehavior) -> bool:
+    name = behavior.name.lower()
+    if any(token in name for token in ("bad", "null", "error", "fail", "invalid")):
+        return True
+    return any(r"\result == \null" in ensure or r"\result == -1" in ensure for ensure in behavior.ensures)
+
+
+def branch_seed_score(behavior: ACSLBehavior) -> tuple[int, int, int, int]:
+    """
+    Rank ACSL behaviors for source/IR branch shaping.
+
+    Branch shaping needs a permissive starting state. A behavior that already
+    forces a guard, such as `capacity == 0`, is useful as its own ACSL test but
+    a poor seed for exploring the opposite branch.
+    """
+    return (
+        0 if _looks_like_failure_behavior(behavior) else 1,
+        0 if _has_exact_scalar_assumption(behavior.assumes) else 1,
+        1 if _extract_result_value(behavior.ensures) is None else 0,
+        len(behavior.assumes),
     )
-    merged.complete_structs.update(preferred.complete_structs)
-    merged.opaque_structs.update(preferred.opaque_structs)
-    merged.function_pointers.update(preferred.function_pointers)
-    for name, fields in preferred.struct_fields.items():
-        merged.struct_fields[name] = dict(fields)
-    merged.opaque_structs.difference_update(merged.complete_structs)
-    return merged
 
 def generate_yaml_from_header(
     header_path: str,
@@ -65,10 +71,13 @@ def generate_yaml_from_header(
     shaping: list[str] | None = None,
     no_shaping: list[str] | None = None,
     ir_backend: str = "clang-json",
+    preprocess_ir: bool = False,
     emit_ir_path: str | None = None,
     ir_diagnostics_path: str | None = None,
     helper_call_rules: tuple[HelperCallRule, ...] = (),
     acsl_parser: AcslParser | None = None,
+    program_model: ProgramModel | None = None,
+    include_static_functions: bool = False,
 ) -> str:
     """
     Generate a complete kleva YAML config from a C header with ACSL annotations.
@@ -90,107 +99,50 @@ def generate_yaml_from_header(
         print(f"kleva synth: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    header_text = header_path_obj.read_text()
-
-    # Parse ACSL annotations
     parser = acsl_parser or ScannerAcslParser()
-    acsl_specs = parser.parse_file(header_path)
-
-    # Read visible declarations/definitions for type and helper-function detection.
-    include_roots = [Path(inc_dir), *(Path(p) for p in extra_includes)]
-    fallback_notes: list[str] = []
-
-    try:
-        funcs = (
-            _parse_header_function_decls(header_path_obj, [str(p) for p in include_roots])
-            if ir_backend == "clang-json"
-            else _fallback_parse_header(header_path_obj)
-        )
-        if ir_backend == "off":
-            fallback_notes.append("header declarations parsed with source-text fallback because IR backend is off")
-    except Exception as exc:
-        fallback_notes.append(
-            f"header declarations parsed with source-text fallback after clang-json failure: {type(exc).__name__}: {exc}"
-        )
-        funcs = _fallback_parse_header(header_path_obj)
-
-    for suggested in _suggest_extra_sources(header_path_obj, include_roots, src_path):
-        if suggested not in extra_sources:
-            extra_sources.append(suggested)
-    extra_sources = _dedupe_paths(extra_sources)
-
-    visible_text_parts = _collect_visible_headers(header_path_obj, include_roots)
-    visible_text_parts.extend(_collect_source_include_headers(src_path, include_roots))
-    if not visible_text_parts:
-        visible_text_parts = [header_text]
-    for candidate in [src_path, *extra_sources]:
-        try:
-            visible_text_parts.append(Path(candidate).read_text())
-        except FileNotFoundError:
-            pass
-    source_text = "\n".join(visible_text_parts)
-    source_include_names = _source_include_names(src_path, include_roots)
-    type_catalog = CTypeCatalog()
-    function_decls = {}
-    function_irs = {}
-    ir_diagnostics: list[IrDiagnostic] = []
-    needs_source_metadata_fallback = ir_backend == "off"
-    if needs_source_metadata_fallback:
-        fallback_notes.append("function/type metadata parsed with source-text fallback because IR backend is off")
-    if ir_backend == "clang-json":
-        try:
-            function_irs, clang_function_decls, clang_type_catalog = _parse_ir_translation_unit_with_decls_and_types(src_path, [str(p) for p in include_roots])
-            function_decls.update(clang_function_decls)
-            type_catalog = clang_type_catalog
-            for extra_source in extra_sources:
-                try:
-                    _extra_irs, extra_decls, extra_catalog = _parse_ir_translation_unit_with_decls_and_types(extra_source, [str(p) for p in include_roots])
-                    function_decls.update(extra_decls)
-                    type_catalog = _merge_type_catalogs(type_catalog, extra_catalog)
-                except Exception as exc:
-                    fallback_notes.append(
-                        f"extra source skipped after clang-json failure: {extra_source}: {type(exc).__name__}: {exc}"
-                    )
-                    pass
-            ir_diagnostics.append(IrDiagnostic("clang-json", src_path, "ok"))
-        except Exception as exc:
-            ir_diagnostics.append(IrDiagnostic("clang-json", src_path, "failed", error=f"{type(exc).__name__}: {exc}"))
-            function_irs = {}
-            needs_source_metadata_fallback = True
-            fallback_notes.append(
-                f"function/type metadata parsed with source-text fallback after clang-json failure: {type(exc).__name__}: {exc}"
+    program = program_model
+    if program is None:
+        program = build_program_model(
+            ProgramInput(
+                header_path=header_path_obj,
+                source_path=src_path,
+                include_dir=inc_dir,
+                extra_includes=tuple(extra_includes),
+                extra_sources=tuple(extra_sources),
+                ir_backend=ir_backend,
+                preprocess_ir=preprocess_ir,
+                include_static_functions=include_static_functions,
+                acsl_parser=parser,
+                shaping_features=frozenset(shaping_features),
             )
-    elif ir_backend != "off":
-        raise ValueError(f"unknown IR backend: {ir_backend}")
-    else:
-        ir_diagnostics.append(IrDiagnostic("off", src_path, "disabled"))
-    if needs_source_metadata_fallback:
-        type_catalog = _merge_type_catalogs(type_catalog, _fallback_build_type_catalog(source_text))
-        function_decls.update(_fallback_function_decl_map(source_text))
-    source_text_for_fallbacks = (
-        source_text
-        if needs_source_metadata_fallback or "regex-fallbacks" in shaping_features
-        else None
-    )
-    if "regex-fallbacks" in shaping_features:
-        fallback_notes.append("source-text branch shapers enabled by regex-fallbacks feature")
-    if fallback_notes:
-        seen_notes: set[str] = set()
-        fallback_notes = [note for note in fallback_notes if not (note in seen_notes or seen_notes.add(note))]
-        for note in fallback_notes:
-            print(f"kleva synth warning: {note}", file=sys.stderr)
-        ir_diagnostics.extend(
-            IrDiagnostic("source-fallback", src_path, "used", error=note)
-            for note in fallback_notes
         )
+        program.print_fallback_warnings()
+    funcs = program.functions
+    acsl_specs = program.acsl_specs
+    function_irs = program.function_irs
+    function_decls = program.function_decls
+    type_catalog = program.type_catalog
+    source_text_for_fallbacks = program.source_text_for_fallbacks()
+    source_include_names = program.source_include_names
+    extra_sources = program.extra_sources
+    fallback_notes = program.fallback_notes
+    source_included = include_static_functions
+    module_header = str(Path(src_path).resolve()) if source_included else header_path_obj.name
     if emit_ir_path:
         _write_ir_json(function_irs, emit_ir_path)
     if ir_diagnostics_path:
-        _write_ir_diagnostics(ir_diagnostics, ir_diagnostics_path)
+        _write_ir_diagnostics(program.diagnostics, ir_diagnostics_path)
     helper_params = {
         name: tuple(p.name for p in decl.params)
         for name, decl in function_decls.items()
     }
+
+    def fallback_facts_for(
+        function_name: str,
+        candidate_name: str | None = None,
+        candidate_origin: str | None = None,
+    ) -> list[dict[str, str]]:
+        return program.fallback_fact_dicts(function_name, candidate_name, candidate_origin)
 
     klee_clang = resolve_klee_clang()
     llvm_link = resolve_llvm_link()
@@ -214,10 +166,14 @@ def generate_yaml_from_header(
         "",
         "module:",
         f"  name:        {module_name}",
-        f"  header:      {header_path_obj.name}",
+        f"  header:      {module_header}",
         f"  source:      {src_path}",
         f"  include_dir: {inc_dir}",
     ]
+    if source_included:
+        lines.append("  source_included: true")
+        lines.append("  # source_included means generated harnesses include the primary .c")
+        lines.append("  # directly so static/internal functions are callable.")
 
     if extra_includes:
         lines.append("  extra_includes:")
@@ -284,27 +240,35 @@ def generate_yaml_from_header(
 
                 if null_params and not valid_params:
                     # Pure null-guard: generate null body
-                    body, outputs, cleanup, preamble = _gen_null_setup_body(
+                    result = _gen_null_setup_body(
                         func, null_params, behavior, source_text_for_fallbacks, type_catalog, function_decls, shaping_features,
                         function_ir=func_ir,
+                        helper_irs=function_irs,
+                        helper_params=helper_params,
                     )
                 elif not null_params:
                     # Valid/scalar-only path: generate a concrete call using
                     # object constructors and scalar assumptions.
-                    body, outputs, cleanup, preamble = _gen_valid_setup_body(
+                    result = _gen_valid_setup_body(
                         func, valid_params, behavior, source_text_for_fallbacks, type_catalog, function_decls,
                         shaping_features=shaping_features,
                         function_ir=func_ir,
+                        helper_irs=function_irs,
+                        helper_params=helper_params,
                     )
                 else:
                     # Mixed or unknown: handle gracefully
-                    body, outputs, cleanup, preamble = _gen_mixed_test(
+                    result = _gen_mixed_test(
                         func, behavior, source_text_for_fallbacks, type_catalog, function_decls, shaping_features,
                         function_ir=func_ir,
+                        helper_irs=function_irs,
+                        helper_params=helper_params,
                     )
 
                 lines.extend(_emit_yaml_function(
-                    func, behavior, body, outputs, cleanup, ktest_dir, preamble, source_include_names
+                    func, behavior, result.body, result.outputs, result.cleanup, ktest_dir, result.preamble, source_include_names,
+                    inputs=result.inputs,
+                    candidate_facts=fallback_facts_for(func.name),
                 ))
 
             branch_seed: ACSLBehavior | None = None
@@ -321,15 +285,7 @@ def generate_yaml_from_header(
                     branch_seed = behavior
                     branch_seed_valid_params = valid_params
                     continue
-                current_score = (
-                    _extract_result_value(behavior.ensures) is None,
-                    len(behavior.assumes),
-                )
-                best_score = (
-                    _extract_result_value(branch_seed.ensures) is None,
-                    len(branch_seed.assumes),
-                )
-                if current_score > best_score:
+                if branch_seed_score(behavior) > branch_seed_score(branch_seed):
                     branch_seed = behavior
                     branch_seed_valid_params = valid_params
 
@@ -345,9 +301,18 @@ def generate_yaml_from_header(
                     helper_irs=function_irs,
                     helper_params=helper_params,
                 )
+                if "test-diversity" in shaping_features:
+                    candidates.extend(curated_diversity_candidates(func, SCALAR_BOUNDS, branch_seed.assumes))
+                reduction = reduce_branch_candidates(candidates)
+                candidates = reduction.kept
                 if candidates:
                     lines.append("")
                     lines.append(f"  # {func.name} — implementation-shaped branch candidates")
+                    if reduction.original_count != len(candidates):
+                        lines.append(
+                            f"  # Candidate reduction: kept {len(candidates)} of {reduction.original_count} "
+                            f"(deduped {reduction.deduped_count}, budget-skipped {reduction.budget_skip_count})"
+                        )
                     for candidate in candidates:
                         test_name = f"{func.name}_{candidate.name}"
                         ktest_dir = f"klee_build/klee_out_{test_name}"
@@ -357,7 +322,7 @@ def generate_yaml_from_header(
                             ensures=branch_seed.ensures,
                             assigns=branch_seed.assigns,
                         )
-                        body, outputs, cleanup, preamble = _gen_valid_setup_body(
+                        result = _gen_valid_setup_body(
                             func,
                             branch_seed_valid_params,
                             shaped_behavior,
@@ -369,18 +334,23 @@ def generate_yaml_from_header(
                             source_shape_oracle=candidate.oracle,
                             source_shape_witnesses=candidate.witness_outputs,
                             function_ir=func_ir,
+                            helper_irs=function_irs,
+                            helper_params=helper_params,
                             object_paths=candidate.object_paths,
                             call_arg_overrides=candidate.call_arg_overrides,
                             witness_setup=candidate.witness_setup,
                             extra_outputs=candidate.extra_outputs,
+                            post_state_facts=candidate.post_state_facts,
+                            fixture_requirements=candidate.fixture_requirements,
+                            branch_facts=candidate.branch_facts,
                         )
-                        preamble = [*preamble, *candidate.preamble]
+                        preamble = [*result.preamble, *candidate.preamble]
                         lines.extend(_emit_yaml_function(
                             func,
                             shaped_behavior,
-                            body,
-                            outputs,
-                            cleanup,
+                            result.body,
+                            result.outputs,
+                            result.cleanup,
                             ktest_dir,
                             preamble,
                             source_include_names,
@@ -388,7 +358,11 @@ def generate_yaml_from_header(
                             source_location=candidate.source_location,
                             target_branch=candidate.target_branch,
                             candidate_origin=candidate.origin,
-                            candidate_facts=candidate.semantic_fact_dicts(),
+                            candidate_facts=[
+                                *candidate.semantic_fact_dicts(),
+                                *fallback_facts_for(func.name, candidate.name, candidate.origin),
+                            ],
+                            inputs=result.inputs,
                         ))
         else:
             # No ACSL spec: emit a basic test with just function call
@@ -403,16 +377,12 @@ def generate_yaml_from_header(
             pointer_params = [p for p in func.params if p.is_pointer]
             nullable_params = [
                 p for p in pointer_params
-                if (
-                    _ir_accepts_null_param(func_ir, p.name)
-                    if func_ir is not None
-                    else _fallback_function_accepts_null_param(source_text_for_fallbacks, func.name, p.name)
-                )
+                if program.accepts_null_param(func.name, p.name)
             ]
             if nullable_params:
                 # Null test for first pointer
                 np = nullable_params[0]
-                body, outputs, cleanup, preamble = _gen_null_setup_body(
+                result = _gen_null_setup_body(
                     func, [np.name],
                     ACSLBehavior(name="null", assumes=[f"{np.name} == \\null"]),
                     source_text_for_fallbacks,
@@ -420,20 +390,24 @@ def generate_yaml_from_header(
                     function_decls,
                     shaping_features,
                     function_ir=func_ir,
+                    helper_irs=function_irs,
+                    helper_params=helper_params,
                 )
                 lines.extend(_emit_yaml_function(
                     func,
                     ACSLBehavior(name="null", assumes=[f"{np.name} == \\null"]),
-                    body, outputs, cleanup,
+                    result.body, result.outputs, result.cleanup,
                     f"klee_build/klee_out_{func.name}_null",
-                    preamble,
+                    result.preamble,
                     source_include_names,
+                    inputs=result.inputs,
+                    candidate_facts=fallback_facts_for(func.name),
                 ))
 
             # Valid test with constructors for all pointer params
             if func.params:
                 valid_names = [p.name for p in func.params if p.is_pointer and p.base_type != "char"]
-                body, outputs, cleanup, preamble = _gen_valid_setup_body(
+                result = _gen_valid_setup_body(
                     func, valid_names or ([] if not pointer_params else [pointer_params[0].name]),
                     ACSLBehavior(name="valid", assumes=[]),
                     source_text_for_fallbacks,
@@ -441,14 +415,18 @@ def generate_yaml_from_header(
                     function_decls,
                     shaping_features=shaping_features,
                     function_ir=func_ir,
+                    helper_irs=function_irs,
+                    helper_params=helper_params,
                 )
                 lines.extend(_emit_yaml_function(
                     func,
                     ACSLBehavior(name="valid", assumes=[]),
-                    body, outputs, cleanup,
+                    result.body, result.outputs, result.cleanup,
                     f"klee_build/klee_out_{func.name}_valid",
-                    preamble,
+                    result.preamble,
                     source_include_names,
+                    inputs=result.inputs,
+                    candidate_facts=fallback_facts_for(func.name),
                 ))
 
     return "\n".join(lines) + "\n"

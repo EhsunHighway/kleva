@@ -28,6 +28,7 @@ SHAPING_FEATURES = {
     "state-switches",
     "callee-success",
     "fallback-lookups",
+    "test-diversity",
     "regex-fallbacks",
 }
 DEFAULT_SHAPING_FEATURES = frozenset(SHAPING_FEATURES - {"regex-fallbacks"})

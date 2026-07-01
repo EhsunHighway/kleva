@@ -3,6 +3,10 @@
 This plan tracks the migration from regex-heavy source shaping toward a typed
 AST/IR-driven architecture.
 
+Architecture reference:
+
+- `docs/frama-c-inspired-static-analysis.md`
+
 Status legend:
 
 - `[x]` done and tested
@@ -724,6 +728,46 @@ Tasks:
   extraction fails, or `regex-fallbacks` is requested.
 - `[x]` `--ir-diagnostics` now records `source-fallback` entries when fallback
   is used.
+- `[x]` Synthesis now obtains function declarations, function IR,
+  nullable-parameter checks, and fallback facts through `ProgramModel` instead
+  of calling parser or fallback helpers directly from the orchestration layer.
+- `[x]` Fallback use is now emitted as candidate metadata:
+  function-scoped fallback facts are attached to generated entries, and
+  regex-origin candidates get candidate-scoped fallback facts.
+- `[x]` Fixture requirements now cover scalar object-path assumptions such as
+  `obj->field == value`, nested paths such as `obj->nested->field`, and array
+  element paths such as `array[0].field`.
+- `[x]` Fixture requirements now report incompatible constraints, including
+  conflicting exact values for the same field and roots required to be both
+  null and valid.
+- `[x]` Fixture gaps now use explicit `fixture-failed:` comments for unknown
+  allocators, unsupported pointer relations, and conflicting constraints, so
+  unproved diagnostic classification can identify fixture failures.
+- `[x]` Candidate metadata now carries selected-path abstract facts:
+  nullness facts are derived from `== NULL` / `!= NULL` branch facts, scalar
+  interval facts are derived from relational branch facts, and object-path
+  facts are emitted for paths that must be backed.
+- `[x]` Helper-call candidates now propagate helper-summary facts:
+  call-outcome facts identify success/failure paths, helper post-state facts
+  provide object-path metadata, and helper ownership facts are mapped from
+  helper parameters to caller argument expressions.
+- `[x]` Added generic helper-effect summaries in
+  `src/kleva/shaping/ir_helper_effects.py`. Summaries infer:
+  success/failure fixture setup from helper guards, field/array-slot/call side
+  effects, post-state facts, and ownership effects mapped from helper
+  parameters to caller argument expressions.
+- `[x]` Callee candidates now use helper-effect summaries to request both
+  helper-success and helper-failure fixtures. Side effects are emitted as
+  candidate metadata with generic `helper_effect` facts.
+- `[x]` State-switch shaping now builds transition candidates from a generic
+  transition graph instead of only scanning one direct assignment shape.
+- `[x]` State transition candidates now include `transition` candidate facts
+  with selector, source state, target state, optional guard, and optional
+  helper path.
+- `[x]` Guarded transitions inside switch cases are shaped by combining the
+  switch case setup with the guard setup.
+- `[x]` State transitions can cross helper calls when a helper summary reports
+  a post-state assignment to the caller's state selector.
 - `[x]` Revalidated no-YAML end-to-end `event.c` after fallback isolation:
   19 test vectors, 30 EVA-proven assertions, 0 unproved candidate paths,
   0 skipped candidates.
@@ -754,8 +798,242 @@ Tasks:
   probes instead of hanging indefinitely. The remaining issue is proof cost and
   candidate prioritization for large modules, not YAML dependence.
 
+## Phase 8: AST/IR Test-Quality Recovery
+
+This phase tracks the recovery from "more structural candidates but fewer
+trusted tests" after moving away from regex/scalar flooding. The goal is not to
+recreate blind numeric variation. The goal is to make AST/IR candidates
+construct valid fixtures, expose useful observables, and become EVA-proven
+trusted tests.
+
+### Packet Benchmark
+
+Packet is the first recovery benchmark because it isolates generic C issues:
+buffers, scalar bounds, pointer validity, allocation, ACSL assumptions, and
+return-value oracles.
+
+Baseline before this recovery slice:
+
+- `test_packet_kleva.c`: 24 test functions, 48 assertions, 31 EVA-proven
+  oracle assertions.
+- `test_packet_kleva_unproved.c`: 24 diagnostic/unproved test functions,
+  13 assertions.
+- Older `test_packet_gen.c`: 92 test functions, 272 assertions,
+  181 EVA-proven oracle markers. This older output is not the target shape by
+  itself because some of its volume came from broad scalar variation.
+
+Completed recovery work:
+
+- `[x]` Source-shaped branch candidates for non-void functions now capture the
+  real return value as `out_ret` instead of generating a fake `out_ok = 1`
+  observable.
+- `[x]` Valid `void *` and `const void *` parameters now receive a real local
+  byte buffer when no typed cast target is available, instead of silently using
+  `NULL`.
+- `[x]` Opaque local byte buffers are large enough for small boundary-overflow
+  candidates.
+- `[x]` Generic nonmatching numeric setup now prefers `N + 1` rather than
+  blindly using `0`, so inequality shaping does not accidentally violate
+  nonzero ACSL preconditions.
+- `[x]` Code generation removes stale `_unproved.c` and
+  `_unproved_report.md` artifacts when a later run has no unproved candidates.
+- `[x]` Revalidated no-YAML `packet.c` end to end:
+  48 test vectors, 57 EVA-proven assertions, 0 unproved candidates,
+  0 skipped candidates.
+- `[x]` Confirmed stale packet diagnostic artifacts are removed:
+  `test_packet_kleva_unproved.c` and
+  `test_packet_kleva_unproved_report.md` are absent after the clean run.
+- `[x]` Added generic ACSL old-state postcondition witnesses. KLEVA now
+  snapshots `\old(...)` expressions before the call and emits post-call
+  boolean outputs for relations such as:
+  - `field == \old(field) + amount`
+  - `field == \old(field) - amount`
+- `[x]` Added generic allocation-failure shaping from typed IR. KLEVA now
+  detects guarded allocation results such as `p = malloc(...)` followed by
+  `if (!p) return ...`, and field allocation results such as
+  `obj->field = malloc(...)` followed by `if (!obj->field) return ...`.
+- `[x]` Added an allocator-control shim for generated allocation-failure
+  candidates. KLEE and EVA redirect source allocation calls to
+  `__kleva_malloc`, `__kleva_calloc`, `__kleva_realloc`, and `__kleva_free`
+  only for recipes that use the shim, so allocator-failure proofs match the
+  generated runtime tests without globally interposing libc allocation.
+- `[x]` Revalidated preprocessed no-YAML `packet.c` after allocation-failure
+  shaping:
+  39 test vectors, 36 trusted unit tests, 88 trusted assertions,
+  62 EVA-proven assertions, 3 unproved diagnostic outputs, 0 skipped
+  candidates.
+- `[x]` Packet trusted-test coverage after allocation-failure shaping:
+  77.5% line coverage and 72.7% branch coverage for `src/network/packet.c`.
+  - `field == \old(field)`
+- `[x]` Old-state witnesses skip consumed/transferred parameters so KLEVA does
+  not read through objects that the function may free or take ownership of.
+- `[x]` Added generic ACSL assumption shaping for pointer-distance relations
+  such as `(size_t)(obj->current - obj->base) < n` and
+  `(size_t)(obj->current - obj->base) >= n`.
+- `[x]` The stronger oracle exposed that the packet no-headroom fixture was
+  not actually entering the no-headroom path. The generic pointer-distance
+  assumption shaper fixed it: `test_prepend_no_headroom_tv001` now sets
+  `p->data = p->head`, returns `-1`, and proves `p->len` stayed unchanged.
+- `[x]` Revalidated no-YAML `packet.c` after oracle strengthening:
+  48 test vectors, 64 EVA-proven assertions, 0 unproved candidates,
+  0 skipped candidates.
+- `[x]` Added generic IR direct-assignment witnesses for straight-line
+  post-state facts when ACSL is weak or missing. KLEVA can now emit post-call
+  witnesses from typed assignments such as `ctx->ready = 1`.
+- `[x]` Added Clang AST extraction for compound assignments by translating
+  operations such as `ctx->count += 1` into typed assignment facts equivalent
+  to `ctx->count = ctx->count + 1`.
+- `[x]` Added old-target snapshots for IR assignment witnesses, so compound
+  side-effect oracles compare against the pre-call value rather than the
+  already-updated post-call value.
+- `[x]` Suppressed direct IR assignment witnesses on source-shaped branch
+  candidates unless the behavior explicitly represents a success result. This
+  prevents early-return failure tests from requesting post-state changes that
+  occur only after the guard.
+- `[x]` Revalidated no-YAML `packet.c` after conservative IR witness gating:
+  38 trusted tests, 92 assertions, 62 EVA-proven oracle assertions,
+  0 unproved candidates, 0 skipped candidates.
+- `[x]` Added typed path-sensitive post-state facts for true `if` candidates.
+  Direct assignments inside the selected true branch can now become candidate
+  post-state facts; false candidates do not inherit those facts.
+- `[x]` Added typed path-sensitive post-state facts for `switch` case
+  candidates and switch-case guard candidates. This gives state-machine
+  branches a generic way to expose state updates without source-text matching.
+- `[x]` Added bodygen rendering for typed `PostStateFact` values, so shapers
+  describe postconditions structurally and bodygen emits the C witness code.
+- `[x]` Revalidated no-YAML `packet.c` after path-sensitive post-state facts:
+  38 trusted tests, 92 assertions, 62 EVA-proven oracle assertions,
+  0 unproved candidates, 0 skipped candidates.
+- `[x]` Added `kleva quality-report`, a generated-test quality report that
+  scans trusted unit tests and unproved diagnostic artifacts without using
+  coverage feedback.
+- `[x]` Pipeline runs now write `test_<module>_kleva_summary.json` next to
+  generated unit tests, recording recipes, proven assertions, unproved
+  outputs, skipped candidates, and runtime.
+- `[x]` Revalidated the report on current `networking_simulator/tests/unit`
+  artifacts: 402 trusted tests, 1204 trusted assertions, 632 EVA-proven
+  oracle assertions, and 108 unproved diagnostic items. Packet has summary
+  metadata after regeneration: 38 recipes, 62 proven assertions,
+  0 unproved outputs, 0 skipped candidates, 121.797s runtime.
+
+Current packet result:
+
+- `test_packet_kleva.c`: 36 test functions, 88 assertions, 62 EVA-proven
+  oracle assertions.
+- Strengthened side-effect oracles are emitted only where the candidate path is
+  compatible with the post-state update.
+- `test_packet_kleva_unproved.c`: 3 diagnostic candidate tests with 3
+  unproved diagnostic outputs.
+
+### Remaining Recovery Work
+
+- `[x]` Extend old-state witness extraction beyond direct ACSL `\old(...)`
+  clauses by deriving simple post-state facts from IR assignments when ACSL is
+  missing or too weak.
+- `[x]` Compare generated packet paths against the older `test_packet_gen.c`
+  scenarios and classify what is still missing:
+  not generated, generated but duplicate-suppressed, generated but not useful,
+  or intentionally removed blind scalar variation.
+  - `[x]` Wrote `networking_simulator/tests/packet_kleva_comparison.md`.
+  - `[x]` Classified old `packet_prepend` and `packet_strip` volume as mostly
+    blind scalar variation.
+  - `[x]` Identified meaningful missing recovery targets: curated scalar
+    boundary values and generic byte-buffer data diversity.
+- `[x]` Add generic path diversity controls so scalar-only and buffer-heavy
+  functions recover meaningful boundary cases without returning to broad
+  blind flooding.
+  - `[x]` Added `shaping/diversity.py`, a generic curated diversity shaper.
+  - `[x]` Scalar diversity changes one scalar parameter at a time and uses
+    compact boundary values instead of Cartesian products.
+  - `[x]` Length-like scalar parameters receive `0`, `1`, and `2` candidates.
+  - `[x]` Byte-buffer diversity supports all-zero, all-`0xff`, and first-byte
+    set content patterns.
+  - `[x]` Byte-buffer content is represented as typed fixture requirements, so
+    content is applied after buffer materialization instead of being overwritten
+    by later fixture setup.
+  - `[x]` Diversity candidates carry `diversity` candidate facts in generated
+    YAML and diagnostic metadata.
+- `[x]` Improve post-call witness selection so AST/IR candidates assert
+  behaviorally meaningful values, not just easy-to-prove locals.
+  - `[x]` Removed weak `out_ok` fallback oracles for void calls with no
+    observable return value or post-call witness.
+  - `[x]` Emit explicit `oracle-missing:` markers and diagnostic
+    `out_missing_oracle` outputs instead of silently producing assertion-free
+    or meaningless trusted tests.
+  - `[x]` Preserve real post-state, callback, and side-effect witnesses without
+    adding weak placeholder outputs.
+- `[x]` Add a compact benchmark report command or script that prints, per
+  module:
+  trusted test functions, trusted assertions, EVA-proven assertions,
+  unproved diagnostics, skipped candidates, and runtime.
+- `[x]` Add generated-test comparison by explicit API/function names so older
+  and newer generated outputs can be compared without guessing names from
+  underscores.
+- `[~]` Rerun the recovery ladder:
+  `packet -> interface -> event/scheduler -> arp_cache/arp -> icmp -> udp -> tcp -> host`.
+  Current no-YAML validation:
+
+  | Module | Recipes | Trusted tests | Trusted assertions | EVA-proven assertions | Unproved diagnostics | Unproven outputs | Skipped / fixture-failed | Runtime |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+  | `packet` | 39 | 36 | 88 | 62 | 3 | 3 | 0 | 84.839s |
+  | `interface` | 52 | 29 | 82 | 66 | 23 | 26 | 0 | 105.803s |
+  | `event` | 35 | 32 | 126 | 103 | 3 | 5 | 0 | 69.028s |
+  | `scheduler` | 48 | 25 | 53 | 38 | 23 | 21 | 0 | 107.508s |
+  | `arp_cache` | 206 | 122 | 299 | 128 | 84 | 0 | 0 | 981.871s |
+
+  Validation rule: trusted tests live in `unit/test_<module>_kleva.c` and only
+  contain EVA-proven singleton assertions. Unproved candidates live in
+  `unit/test_<module>_kleva_unproved.c` plus
+  `unit/test_<module>_kleva_unproved_report.md`; they are diagnostic evidence,
+  not regression-pass oracles.
+
+  Findings from the first two ladder runs:
+
+  - `[x]` Unknown typedef/function-pointer parameters are not shaped as scalar
+    diversity values.
+  - `[x]` Scalar diversity uses concrete call-argument overrides instead of
+    setup assignments, so KLEE does not re-symbolize a value that the candidate
+    is supposed to pin.
+  - `[x]` Scalar diversity respects active ACSL scalar constraints, so
+    contract-invalid boundary values such as `capacity = 0` under
+    `capacity > 0` are not generated as normal diversity candidates.
+  - `[x]` Diversity remains one input dimension at a time; it does not create
+    Cartesian products.
+  - `[x]` IR post-state witnesses no longer reference callee-local temporaries
+    that are invisible in generated harnesses. This fixed an `event_queue_push`
+    harness compile failure caused by asserting against `new_events`, a local
+    variable inside `event_queue_push`.
+  - `[x]` Allocation-failure harnesses now emit native compile metadata and use
+    relative failure injection. The generated allocator shim preserves
+    `realloc` contents, tracks allocation sizes, and generated unit drivers
+    reset allocator state before each test call. This fixed the trusted
+    `event_queue_push` allocation/reallocation tests at native runtime.
+  - `[x]` Trusted `event.c` generated tests compile and pass with allocator
+    redirection enabled. Current trusted coverage for `src/engine/event.c` is
+    89.6% line coverage and 77.3% branch coverage.
+  - `[x]` Helper-success setup facts are no longer treated as post-call facts.
+    This prevents stale or false witnesses after a helper mutates the same
+    object path that the fixture used to reach the branch.
+  - `[x]` Helper-returned pointer-array slots are now backed by heap objects
+    instead of stack objects, so generated fixtures remain valid when caller
+    code takes ownership and frees the returned pointer.
+  - `[x]` Trusted `scheduler.c` generated tests compile and pass with allocator
+    redirection enabled. Current trusted coverage for `src/engine/scheduler.c`
+    is 89.6% line coverage and 70.0% branch coverage.
+  - `[x]` Revalidated no-YAML `arp_cache.c` end to end. The typed table/loop
+    shapers generated 206 recipes with no skipped candidates. Current trusted
+    coverage for `src/protocols/arp_cache.c` is 75.0% line coverage and 70.0%
+    branch coverage.
+- `[x]` For modules with remaining unproved diagnostics, classify each reason:
+  weak fixture, weak oracle, missing ACSL, EVA imprecision, implementation
+  bug, or timeout.
+  - `[x]` Current diagnostic categories are `weak_fixture`, `weak_oracle`,
+    `missing_acsl`, `eva_imprecision`, `implementation_bug`, and `timeout`.
+- `[ ]` Keep regex/source-text fallback disabled in the default path. Any
+  project-specific rule must live behind explicit rules/plugins, not inside
+  generic AST/IR shaping.
+
 ## Immediate Next Step
 
-Tighten large-module smoke behavior so expensive ownership/free probes are
-reported quickly as unproved or timed out, then rerun no-YAML `host.c` to
-completion before moving to `tcp.c`.
+Continue the recovery ladder with `arp`, keeping the same report columns
+and keeping regex/source-text fallback disabled by default.

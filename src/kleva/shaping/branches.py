@@ -7,7 +7,19 @@ from typing import Callable
 from ..ast.model import CFunction, CParam, CTypeCatalog, DerivedLocal
 from ..ir.model import FunctionIR
 from ..ir.relations import negated_relation
-from .candidates import BranchCandidate, BranchFact, CallOutcomeFact, PostStateFact, SemanticFact
+from .candidates import (
+    BranchCandidate,
+    BranchFact,
+    CallOutcomeFact,
+    HelperSideEffectFact,
+    NullnessFact,
+    ObjectPathFact,
+    OwnershipPathFact,
+    PostStateFact,
+    ScalarIntervalFact,
+    SemanticFact,
+    StateTransitionFact,
+)
 
 
 @dataclass(frozen=True)
@@ -323,6 +335,46 @@ def _normalized_semantic_fact(fact: SemanticFact, macro_values: dict[str, str]) 
             _normalize_macro_text(fact.target, macro_values),
             fact.relation,
             _normalize_macro_text(fact.value, macro_values),
+        )
+    if isinstance(fact, NullnessFact):
+        return NullnessFact(
+            _normalize_macro_text(fact.target, macro_values),
+            fact.state,
+        )
+    if isinstance(fact, ScalarIntervalFact):
+        return ScalarIntervalFact(
+            _normalize_macro_text(fact.target, macro_values),
+            _normalize_macro_text(fact.lower, macro_values) if fact.lower is not None else None,
+            _normalize_macro_text(fact.upper, macro_values) if fact.upper is not None else None,
+            _normalize_macro_text(fact.exact, macro_values) if fact.exact is not None else None,
+        )
+    if isinstance(fact, OwnershipPathFact):
+        return OwnershipPathFact(
+            _normalize_macro_text(fact.target, macro_values),
+            fact.action,
+            _normalize_macro_text(fact.via, macro_values),
+        )
+    if isinstance(fact, HelperSideEffectFact):
+        return HelperSideEffectFact(
+            fact.kind,
+            _normalize_macro_text(fact.target, macro_values),
+            _normalize_macro_text(fact.value, macro_values) if fact.value is not None else None,
+            _normalize_macro_text(fact.evidence, macro_values) if fact.evidence is not None else None,
+        )
+    if isinstance(fact, StateTransitionFact):
+        return StateTransitionFact(
+            _normalize_macro_text(fact.selector, macro_values),
+            _normalize_macro_text(fact.source, macro_values),
+            _normalize_macro_text(fact.target, macro_values),
+            _normalize_macro_text(fact.guard, macro_values) if fact.guard is not None else None,
+            _normalize_macro_text(fact.via, macro_values) if fact.via is not None else None,
+        )
+    if isinstance(fact, ObjectPathFact):
+        return ObjectPathFact(
+            _normalize_macro_text(fact.root, macro_values),
+            tuple(_normalize_macro_text(part, macro_values) for part in fact.path),
+            fact.root_type,
+            fact.value_type,
         )
     if isinstance(fact, CallOutcomeFact):
         return fact

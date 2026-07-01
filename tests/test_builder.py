@@ -1,8 +1,9 @@
 import unittest
 
-from kleva.builder import build_recipe, scalar_sweep_values
+from kleva.builder import build_recipe, reduce_equivalent_candidate_recipes, scalar_sweep_values
 from kleva.config import Bounds, FunctionSpec, InputSpec
 from kleva.ktest import KTestObject
+from kleva.recipe import Recipe
 
 
 def _obj(name, value, size=8):
@@ -49,10 +50,10 @@ class BuilderTests(unittest.TestCase):
         values = scalar_sweep_values(spec, [_obj("header_len", 999)])
 
         self.assertEqual(values[0], {"header_len": 0})
-        self.assertEqual(values[-1], {"header_len": 21})
-        self.assertEqual(len(values), 22)
+        self.assertEqual(values[-1], {"header_len": 2})
+        self.assertEqual(len(values), 3)
 
-    def test_large_bounded_scalar_is_left_to_klee(self):
+    def test_large_bounded_scalar_uses_boundary_sweep(self):
         spec = FunctionSpec(
             name="packet_create",
             ktest_dir="klee_out",
@@ -62,7 +63,44 @@ class BuilderTests(unittest.TestCase):
             cleanup=[],
         )
 
-        self.assertEqual(scalar_sweep_values(spec, [_obj("capacity", 64)]), [])
+        self.assertEqual(
+            scalar_sweep_values(spec, [_obj("capacity", 64)]),
+            [{"capacity": 1}, {"capacity": 2}, {"capacity": 1023}, {"capacity": 1024}, {"capacity": 512}],
+        )
+
+    def test_recipe_reducer_preserves_direct_recipes(self):
+        recipes = [
+            Recipe(f"direct_tv{i:03d}", [f"int x = {i};"], ["run(x);"], [], ["out_ret"])
+            for i in range(1, 4)
+        ]
+
+        kept, skipped = reduce_equivalent_candidate_recipes(recipes)
+
+        self.assertEqual(skipped, 0)
+        self.assertEqual([recipe.fn_id for recipe in kept], ["direct_tv001", "direct_tv002", "direct_tv003"])
+
+    def test_recipe_reducer_caps_equivalent_candidate_recipes(self):
+        recipes = [
+            Recipe(
+                f"shape_tv{i:03d}",
+                [f"int x = {i};"],
+                ["int out_ret = run(x);"],
+                [],
+                ["out_ret"],
+                candidate=True,
+                source_location="source.c:10:5",
+                target_branch="if x > 0",
+                candidate_origin="ir",
+                candidate_facts=[{"kind": "branch", "expr": "x > 0"}],
+            )
+            for i in range(1, 4)
+        ]
+
+        kept, skipped = reduce_equivalent_candidate_recipes(recipes)
+
+        self.assertEqual(skipped, 2)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].fn_id, "shape_tv001")
 
 
 if __name__ == "__main__":

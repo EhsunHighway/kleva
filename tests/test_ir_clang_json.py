@@ -23,6 +23,8 @@ from kleva.ir.model import (
     IfStmt,
     LoopStmt,
     ReturnStmt,
+    BreakStmt,
+    ContinueStmt,
     SwitchStmt,
     VarRef,
 )
@@ -126,7 +128,23 @@ static int private_helper(Item *item);
 
         self.assertIn("run", funcs)
         self.assertIn("helper", decls)
+        self.assertNotIn("helper", funcs)
         self.assertEqual(decls["helper"].params[0].name, "value")
+
+    def test_parse_translation_unit_ignores_declaration_only_functions(self):
+        source = """
+            int declared_only(int value);
+            int defined(int value) {
+                return declared_only(value);
+            }
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "sample.c"
+            src.write_text(source)
+
+            funcs = parse_translation_unit(src)
+
+        self.assertEqual(set(funcs), {"defined"})
 
     def test_extracts_if_and_switch_facts_from_real_clang_ast(self):
         source = """
@@ -188,6 +206,27 @@ static int private_helper(Item *item);
         switch_stmt = next(stmt for stmt in funcs["run"].statements if isinstance(stmt, SwitchStmt))
 
         self.assertEqual([case.value for case in switch_stmt.cases], ["STATE_INIT", "STATE_DONE"])
+
+    def test_extracts_break_and_continue_from_real_clang_ast(self):
+        source = """
+            int scan(int *items, int n) {
+                for (int i = 0; i < n; i++) {
+                    if (items[i] == 0) continue;
+                    if (items[i] == 7) break;
+                }
+                return 0;
+            }
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "sample.c"
+            src.write_text(source)
+
+            funcs = parse_translation_unit(src)
+
+        loop_stmt = next(stmt for stmt in funcs["scan"].statements if isinstance(stmt, LoopStmt))
+
+        self.assertTrue(any(isinstance(stmt, ContinueStmt) for if_stmt in loop_stmt.body if isinstance(if_stmt, IfStmt) for stmt in if_stmt.body))
+        self.assertTrue(any(isinstance(stmt, BreakStmt) for if_stmt in loop_stmt.body if isinstance(if_stmt, IfStmt) for stmt in if_stmt.body))
 
     def test_extracts_direct_call_statements_from_real_clang_ast(self):
         source = """
@@ -260,6 +299,32 @@ static int private_helper(Item *item);
         self.assertEqual(assignment.value.c_type, "void *")
         self.assertIsNotNone(ret.value)
         self.assertEqual(ret.value.c_type, "int")
+
+    def test_extracts_compound_assignment_as_assignment_from_real_clang_ast(self):
+        source = """
+            typedef struct Counter { int total; } Counter;
+            int add(Counter *counter, int amount) {
+                counter->total += amount;
+                return counter->total;
+            }
+        """
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "sample.c"
+            src.write_text(source)
+
+            funcs = parse_translation_unit(src)
+
+        add = funcs["add"]
+        assignment = next(stmt for stmt in add.statements if isinstance(stmt, AssignmentStmt))
+
+        self.assertIsInstance(assignment.target, FieldAccess)
+        self.assertEqual(assignment.target.field, "total")
+        self.assertIsInstance(assignment.value, BinaryOp)
+        self.assertEqual(assignment.value.op, "+")
+        self.assertIsInstance(assignment.value.left, FieldAccess)
+        self.assertEqual(assignment.value.left.field, "total")
+        self.assertIsInstance(assignment.value.right, VarRef)
+        self.assertEqual(assignment.value.right.name, "amount")
 
     def test_extracts_local_declarations_from_real_clang_ast(self):
         source = """

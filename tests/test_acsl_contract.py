@@ -15,10 +15,11 @@ class AcslContractTests(unittest.TestCase):
         assumes = [
             r"iface == \null || pkt == \NULL",
             r"\valid(sim) && \valid_read(buf + (0 .. len - 1))",
+            r"\valid_read((uint8_t *)header + (0 .. header_len - 1))",
         ]
 
         self.assertEqual(extract_null_params(assumes), ["iface", "pkt"])
-        self.assertEqual(extract_valid_params(assumes), ["sim", "buf"])
+        self.assertEqual(extract_valid_params(assumes), ["sim", "buf", "header"])
 
     def test_extracts_non_null_and_nonzero_params(self):
         assumes = [

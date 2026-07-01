@@ -21,6 +21,18 @@ def literal_for_relation(op: str, rhs: str) -> str:
     return rhs
 
 
+def rhs_value_for_left_relation(op: str, lhs: str) -> str:
+    if op == "<":
+        return f"(({lhs}) + 1)"
+    if op == "<=":
+        return lhs
+    if op == ">":
+        return f"(({lhs}) > 0 ? ({lhs}) - 1 : 0)"
+    if op == ">=":
+        return lhs
+    return lhs
+
+
 def nonmatching_value(value: str) -> str:
     if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", value):
         return f"(({value}) + 1)"
@@ -145,6 +157,15 @@ def assumption_setup_lines(
                     append_unique(lines, f"{target} = {source};", seen)
                 continue
 
+            m = re.fullmatch(r"(\w+)\s*(==|>=|>|<=|<)\s*(\w+)->(\w+)", part)
+            if m:
+                lhs, op, obj, field = m.groups()
+                if obj in params_by_name and param_args and lhs in param_args:
+                    lhs_expr = param_args[lhs]
+                    value = lhs_expr if op == "==" else rhs_value_for_left_relation(op, lhs_expr)
+                    append_unique(lines, f"{param_access(obj, field, param_refs)} = {value};", seen)
+                continue
+
             m = re.fullmatch(r"(\w+)->(\w+)(?:->(\w+))?\s*(==|!=)\s*(0x[0-9a-fA-F]+|\d+)", part)
             if m:
                 obj, field1, field2, op, rhs = m.groups()
@@ -167,17 +188,22 @@ def assumption_setup_lines(
                 append_unique(lines, f"{param_access(obj, field, param_refs)} = {param_access(obj, base, param_refs)};", seen)
                 continue
 
-            m = re.search(r"\\valid_read\(\s*(\w+)->data\s*\+\s*\(0\s*\.\.\s*\1->len\s*-\s*1\)\s*\)", part)
-            if m:
-                obj = m.group(1)
-                if obj in params_by_name:
-                    data_expr = param_access(obj, "data", param_refs)
-                    len_expr = param_access(obj, "len", param_refs)
-                    append_unique(lines, f"uint8_t {obj}_read_data[64];", seen)
-                    append_unique(lines, f"memset({obj}_read_data, 0, sizeof({obj}_read_data));", seen)
-                    append_unique(lines, f"if ({data_expr} == NULL) {data_expr} = {obj}_read_data;", seen)
-                    append_unique(lines, f"if ({len_expr} == 0) {len_expr} = 1;", seen)
-                    append_unique(lines, f"memset({data_expr}, 0, {len_expr});", seen)
+            m = re.fullmatch(
+                r"(?:\(\s*size_t\s*\)\s*)?\(?\s*(\w+)->(\w+)\s*-\s*\1->(\w+)\s*\)?\s*(==|>=|>|<=|<)\s*([A-Za-z_]\w*|0x[0-9a-fA-F]+|\d+)",
+                part,
+            )
+            if m and m.group(1) in params_by_name:
+                obj, field, base, op, rhs = m.groups()
+                rhs = rewrite_value(rhs, param_args)
+                base_expr = param_access(obj, base, param_refs)
+                field_expr = param_access(obj, field, param_refs)
+                if op in {"<", "<="}:
+                    value = base_expr
+                elif op in {"==", ">="}:
+                    value = f"{base_expr} + {rhs}"
+                else:
+                    value = f"{base_expr} + {rhs} + 1"
+                append_unique(lines, f"{field_expr} = {value};", seen)
                 continue
 
             m = re.fullmatch(

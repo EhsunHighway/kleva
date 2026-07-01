@@ -22,7 +22,7 @@ def extract_valid_params(assumes_exprs: list[str]) -> list[str]:
     """Extract parameter names from ACSL `\\valid(...)` and `\\valid_read(...)`."""
     valid_params: list[str] = []
     for expr in assumes_exprs:
-        for m in re.finditer(r"\\(?:valid|valid_read)\((\w+)", expr):
+        for m in re.finditer(r"\\(?:valid|valid_read)\(\s*(?:\([^)]*\)\s*)*([A-Za-z_]\w*)", expr):
             valid_params.append(m.group(1))
     return valid_params
 

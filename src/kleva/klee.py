@@ -23,6 +23,7 @@ import shutil
 from pathlib import Path
 
 from .config import FunctionSpec, KleeSettings
+from .recipe import allocator_redirect_macros_for_lines
 
 
 # ── bitcode compilation ───────────────────────────────────────────────────────
@@ -121,6 +122,7 @@ def run_klee_for_function(
     src_inc:         str,
     extra_sources:   list[str] | None = None,
     extra_includes:  list[str] | None = None,
+    source_included: bool = False,
     base_dir:        str = ".",
     verbose:         bool = True,
 ) -> Path:
@@ -141,17 +143,22 @@ def run_klee_for_function(
 
     harness_c  = str(out_base / "harnesses" / f"klee_{spec.name}.c")
     harness_bc = str(out_base / f"klee_{spec.name}.bc")
-    src_bc     = str(out_base / f"{Path(src_c).stem}_source.bc")
     linked_bc  = str(out_base / f"klee_{spec.name}_linked.bc")
     ktest_dir  = str(out_base / f"klee_out_{spec.name}")
 
     # Rebuild source bitcode for each run. Reusing stale bitcode is unsafe
     # when the selected clang/LLVM version or include path changes.
-    compile_to_bc(
-        ks.klee_clang, src_c, src_bc,
-        ks.klee_include, src_inc, ks.macros, verbose,
-        extra_includes=extra_includes,
-    )
+    macros = [*ks.macros, *_allocator_macros_for_spec(spec)]
+
+    source_bcs: list[str] = []
+    if not source_included:
+        src_bc = str(out_base / f"{Path(src_c).stem}_source.bc")
+        compile_to_bc(
+            ks.klee_clang, src_c, src_bc,
+            ks.klee_include, src_inc, macros, verbose,
+            extra_includes=extra_includes,
+        )
+        source_bcs.append(src_bc)
 
     # Extra dependency bitcode (e.g. event.c when testing scheduler.c).
     extra_bcs: list[str] = []
@@ -159,18 +166,18 @@ def run_klee_for_function(
         dep_bc = str(out_base / f"{Path(dep_c).stem}_source.bc")
         compile_to_bc(
             ks.klee_clang, dep_c, dep_bc,
-            ks.klee_include, src_inc, ks.macros, verbose,
+            ks.klee_include, src_inc, macros, verbose,
             extra_includes=extra_includes,
         )
         extra_bcs.append(dep_bc)
 
     compile_to_bc(
         ks.klee_clang, harness_c, harness_bc,
-        ks.klee_include, src_inc, ks.macros, verbose,
+        ks.klee_include, src_inc, macros, verbose,
         extra_includes=extra_includes,
     )
 
-    link_bitcode(ks.llvm_link, harness_bc, src_bc, *extra_bcs, out=linked_bc, verbose=verbose)
+    link_bitcode(ks.llvm_link, harness_bc, *source_bcs, *extra_bcs, out=linked_bc, verbose=verbose)
 
     run_klee(
         ks.klee, linked_bc, ktest_dir,
@@ -178,3 +185,7 @@ def run_klee_for_function(
     )
 
     return Path(ktest_dir)
+
+
+def _allocator_macros_for_spec(spec: FunctionSpec) -> list[str]:
+    return allocator_redirect_macros_for_lines(spec.preamble, spec.body)

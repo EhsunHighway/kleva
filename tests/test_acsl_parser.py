@@ -70,6 +70,27 @@ int multiline_demo(
         self.assertEqual(behavior.assigns, "*p")
         self.assertEqual(behavior.ensures, [r"\result == 0"])
 
+    def test_global_requires_are_visible_to_named_behaviors(self):
+        header = r"""
+/*@
+    requires \valid(p);
+    behavior ok:
+        assumes n <= p->len;
+        ensures \result == 0;
+    behavior overflow:
+        assumes n > p->len;
+        ensures \result == -1;
+*/
+int strip(Packet *p, size_t n);
+"""
+
+        specs = ScannerAcslParser().parse_text(header)
+        behaviors = specs["strip"].behaviors
+
+        self.assertEqual(behaviors[0].name, "valid")
+        self.assertEqual(behaviors[1].assumes, [r"\valid(p)", "n <= p->len"])
+        self.assertEqual(behaviors[2].assumes, [r"\valid(p)", "n > p->len"])
+
     def test_synthesis_accepts_injected_acsl_parser(self):
         class FakeParser:
             name = "fake"

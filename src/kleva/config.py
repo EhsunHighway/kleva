@@ -197,6 +197,7 @@ class ModuleConfig:
     module_header:    str
     module_source:    str
     include_dir:      str
+    source_included:   bool = False
     extra_sources:      list[str] = field(default_factory=list)  # additional .c files to link into KLEE
     extra_includes:     list[str] = field(default_factory=list)  # additional -I dirs for compilation
     ktest_tool:         str = "ktest-tool"
@@ -223,6 +224,7 @@ def _config_from_data(data: dict[str, Any]) -> ModuleConfig:
         module_header   = mod["header"],
         module_source   = mod["source"],
         include_dir     = mod.get("include_dir", "."),
+        source_included = bool(mod.get("source_included", False)),
         extra_sources   = mod.get("extra_sources", []),
         extra_includes  = mod.get("extra_includes", []),
         ktest_tool      = tools.get("ktest_tool", "ktest-tool"),

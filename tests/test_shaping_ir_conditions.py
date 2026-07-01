@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 
 from kleva.fixtures.construction import safe_c_name
-from kleva.ir.model import ArraySubscript, AssignmentStmt, BinaryOp, CallExpr, CastExpr, DeclarationStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, LoopStmt, SourceLocation, SwitchStmt, UnaryOp, VarRef
-from kleva.shaping.candidates import ObjectPathFact
+from kleva.ir.model import ArraySubscript, AssignmentStmt, BinaryOp, CallExpr, CastExpr, ContinueStmt, DeclarationStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, LoopStmt, ReturnStmt, SourceLocation, SwitchStmt, UnaryOp, VarRef
+from kleva.shaping.candidates import ObjectPathFact, PostStateFact
 from kleva.shaping.ir_byte_order import decoded_field_aliases_from_ir
 from kleva.shaping.ir_conditions import IrConditionOps, condition_candidates_from_ir
 
@@ -25,7 +25,27 @@ def _ops_with_byte_order(func):
     )
 
 
+def _ops_with_function_pointer_typedef():
+    return IrConditionOps(
+        safe_c_name,
+        lambda value: "1" if value == "0" else "0",
+        pointer_like_types=frozenset({"Handler"}),
+    )
+
+
 class IrConditionShapingTests(unittest.TestCase):
+    def test_function_pointer_typedef_truthy_path_uses_guard_not_integer_assignment(self):
+        func = FunctionIR(
+            "register_handler",
+            [IfStmt(UnaryOp("!", VarRef("handler", "Handler")))],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops_with_function_pointer_typedef())
+
+        false_candidate = next(candidate for candidate in candidates if "false_not_handler" in candidate.name)
+        self.assertEqual(false_candidate.setup, ["__GUARD__(handler)"])
+        self.assertNotIn("handler = 1;", false_candidate.setup)
+
     def test_generates_comparison_condition_candidate(self):
         func = FunctionIR(
             "step",
@@ -46,6 +66,142 @@ class IrConditionShapingTests(unittest.TestCase):
         )
         self.assertEqual(candidates[0].source_location, "sample.c:12:5")
         self.assertEqual(candidates[0].target_branch, "if ctx->state == 3")
+
+    def test_true_condition_candidate_records_direct_body_assignment_post_state(self):
+        func = FunctionIR(
+            "step",
+            [IfStmt(
+                BinaryOp("==", FieldAccess(VarRef("ctx"), "state"), IntLiteral(3)),
+                [
+                    AssignmentStmt(
+                        FieldAccess(VarRef("ctx"), "ready"),
+                        IntLiteral(1),
+                    ),
+                ],
+            )],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops())
+
+        self.assertEqual(candidates[0].post_state_facts, [
+            PostStateFact("ctx->ready", "==", "1"),
+        ])
+        self.assertEqual(candidates[1].post_state_facts, [])
+
+    def test_later_candidate_inherits_negated_early_return_guard(self):
+        func = FunctionIR(
+            "add",
+            [
+                IfStmt(
+                    BinaryOp(
+                        "||",
+                        UnaryOp("!", VarRef("ctx", "Context *")),
+                        BinaryOp("==", VarRef("key", "int"), IntLiteral(0)),
+                    ),
+                    [ReturnStmt()],
+                ),
+                IfStmt(
+                    BinaryOp(
+                        "&&",
+                        BinaryOp("==", FieldAccess(FieldAccess(VarRef("ctx", "Context *"), "slot"), "valid"), IntLiteral(1)),
+                        BinaryOp("==", FieldAccess(FieldAccess(VarRef("ctx", "Context *"), "slot"), "key"), VarRef("key", "int")),
+                    ),
+                ),
+            ],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops())
+
+        candidate = next(
+            candidate
+            for candidate in candidates
+            if candidate.name == "ir_if_1_ctx_slot_valid_eq_1_and_ctx_slot_key_eq_key"
+        )
+
+        self.assertEqual(candidate.setup, [
+            "__GUARD__(ctx)",
+            "key = 1;",
+            "ctx->slot->valid = 1;",
+            "ctx->slot->key = key;",
+        ])
+        self.assertEqual(
+            [(fact.target, fact.relation, fact.value) for fact in candidate.branch_facts],
+            [
+                ("ctx", "!=", "0"),
+                ("key", "!=", "0"),
+                ("ctx->slot->valid", "==", "1"),
+                ("ctx->slot->key", "==", "key"),
+            ],
+        )
+
+    def test_terminating_true_branch_does_not_inherit_fallthrough_object_paths(self):
+        func = FunctionIR(
+            "handle",
+            [
+                IfStmt(
+                    UnaryOp("!", VarRef("item", "Item *")),
+                    [ReturnStmt(IntLiteral(-1))],
+                ),
+                IfStmt(
+                    BinaryOp("==", FieldAccess(VarRef("item", "Item *"), "ready", "int"), IntLiteral(1)),
+                ),
+            ],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops())
+        null_candidate = next(
+            candidate for candidate in candidates
+            if candidate.name == "ir_if_0_not_item"
+        )
+        fallthrough_candidate = next(
+            candidate for candidate in candidates
+            if candidate.name == "ir_if_0_false_not_item"
+        )
+
+        self.assertEqual(null_candidate.object_paths, [])
+        self.assertEqual(fallthrough_candidate.object_paths, [
+            ObjectPathFact("item", ("ready",), "Item *", "int"),
+        ])
+
+    def test_later_candidate_inherits_negated_continue_guard(self):
+        slot = ArraySubscript(VarRef("items"), VarRef("i"))
+        func = FunctionIR(
+            "scan",
+            [
+                LoopStmt(
+                    "for",
+                    body=[
+                        IfStmt(
+                            BinaryOp("==", slot, IntLiteral(0)),
+                            [ContinueStmt()],
+                        ),
+                        IfStmt(
+                            BinaryOp("==", slot, IntLiteral(7)),
+                        ),
+                    ],
+                ),
+            ],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops())
+
+        candidate = next(
+            candidate
+            for candidate in candidates
+            if candidate.name == "ir_if_1_items_i_eq_7"
+        )
+
+        self.assertEqual(candidate.setup, [
+            "items[i] = 1;",
+            "items[i] = 7;",
+        ])
+        self.assertEqual(
+            [(fact.target, fact.relation, fact.value) for fact in candidate.branch_facts],
+            [
+                ("items[i]", "!=", "0"),
+                ("items[i]", "==", "7"),
+            ],
+        )
 
     def test_generates_condition_candidate_inside_nested_body(self):
         func = FunctionIR(
@@ -216,12 +372,12 @@ class IrConditionShapingTests(unittest.TestCase):
             [(candidate.name, candidate.setup, candidate.target_branch) for candidate in candidates],
             [(
                 "ir_if_0_item_kind_ne_0",
-                ["item->kind = 1;"],
-                "if item->kind != 0",
+                ["running = 1;", "item->kind = 1;"],
+                "if running; item->kind != 0",
             ), (
                 "ir_if_0_false_item_kind_eq_0",
-                ["item->kind = 0;"],
-                "if item->kind == 0",
+                ["running = 1;", "item->kind = 0;"],
+                "if running; item->kind == 0",
             )],
         )
 
@@ -361,7 +517,7 @@ class IrConditionShapingTests(unittest.TestCase):
             [(candidate.name, candidate.setup) for candidate in candidates],
             [
                 ("ir_if_0_not_scheduler", ["scheduler = 0;"]),
-                ("ir_if_0_false_not_scheduler", ["if (!scheduler) return 0;"]),
+                ("ir_if_0_false_not_scheduler", ["__GUARD__(scheduler)"]),
             ],
         )
 
@@ -376,7 +532,7 @@ class IrConditionShapingTests(unittest.TestCase):
         self.assertEqual(
             [(candidate.name, candidate.setup) for candidate in candidates],
             [
-                ("ir_if_0_truthy_event", ["if (!event) return 0;"]),
+                ("ir_if_0_truthy_event", ["__GUARD__(event)"]),
                 ("ir_if_0_false_truthy_event", ["event = 0;"]),
             ],
         )
@@ -449,6 +605,57 @@ class IrConditionShapingTests(unittest.TestCase):
             ObjectPathFact("ctx", ("conn", "state"), "Context *", "int"),
         ])
 
+    def test_preserves_object_path_facts_through_pointer_array_slot_condition(self):
+        func = FunctionIR(
+            "lookup",
+            [IfStmt(BinaryOp(
+                "==",
+                FieldAccess(
+                    ArraySubscript(
+                        FieldAccess(VarRef("table", "Table *"), "items", "Item **"),
+                        VarRef("i", "int"),
+                        "Item *",
+                    ),
+                    "id",
+                    "int",
+                ),
+                VarRef("wanted", "int"),
+            ))],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops())
+
+        self.assertEqual(candidates[0].object_paths, [
+            ObjectPathFact("table", ("items", "id"), "Table *", "int"),
+        ])
+
+    def test_loop_body_condition_includes_true_loop_bound_setup(self):
+        func = FunctionIR(
+            "lookup",
+            [LoopStmt(
+                "for",
+                BinaryOp("<", VarRef("i", "int"), FieldAccess(VarRef("table", "Table *"), "count", "int")),
+                [IfStmt(BinaryOp(
+                    "==",
+                    FieldAccess(
+                        ArraySubscript(
+                            FieldAccess(VarRef("table", "Table *"), "items", "Item **"),
+                            VarRef("i", "int"),
+                            "Item *",
+                        ),
+                        "id",
+                        "int",
+                    ),
+                    VarRef("wanted", "int"),
+                ))],
+            )],
+        )
+
+        candidates = condition_candidates_from_ir(func, _ops())
+
+        self.assertIn("table->count = 2;", candidates[0].setup)
+        self.assertNotIn("i = ((table->count) > 0 ? (table->count) - 1 : 0);", candidates[0].setup)
+
     def test_pointer_equality_uses_null_assignment_instead_of_scalar_zero(self):
         func = FunctionIR(
             "step",
@@ -465,11 +672,11 @@ class IrConditionShapingTests(unittest.TestCase):
             [(candidate.name, candidate.setup) for candidate in candidates],
             [
                 ("ir_if_0_ctx_next_eq_0", ["ctx->next = NULL;"]),
-                ("ir_if_0_false_ctx_next_ne_0", ["ctx->next = ((Node *)1);"]),
+                ("ir_if_0_false_ctx_next_ne_0", ["/* kleva: non-null pointer path ctx->next backed by fixture */"]),
             ],
         )
 
-    def test_pointer_inequality_uses_typed_non_null_assignment(self):
+    def test_pointer_inequality_uses_fixture_backed_pointer_path(self):
         func = FunctionIR(
             "step",
             [IfStmt(BinaryOp(
@@ -484,7 +691,7 @@ class IrConditionShapingTests(unittest.TestCase):
         self.assertEqual(
             [(candidate.name, candidate.setup) for candidate in candidates],
             [
-                ("ir_if_0_ctx_next_ne_0", ["ctx->next = ((Node *)1);"]),
+                ("ir_if_0_ctx_next_ne_0", ["/* kleva: non-null pointer path ctx->next backed by fixture */"]),
                 ("ir_if_0_false_ctx_next_eq_0", ["ctx->next = NULL;"]),
             ],
         )

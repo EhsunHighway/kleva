@@ -4,12 +4,14 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 from ..ir.aliases import AliasMap, record_alias, resolve_aliases
-from ..ir.model import AssignmentStmt, BinaryOp, CallExpr, DeclarationStmt, Expr, FunctionIR, IfStmt, LoopStmt, ReturnStmt, SourceLocation, Stmt, SwitchStmt, UnaryOp, VarRef
+from ..ir.model import AssignmentStmt, BinaryOp, CallExpr, CastExpr, DeclarationStmt, Expr, FunctionIR, IfStmt, LoopStmt, ReturnStmt, SourceLocation, Stmt, SwitchStmt, UnaryOp, VarRef
 from ..ir.naming import safe_name
 from ..ir.relations import flipped_relation, int_value
-from ..ir.render import assignable_expr, value_expr
+from ..ir.render import assignable_expr, is_pointer_expr, value_expr
 from ..ir.walk import body_has_return
-from .candidates import BranchCandidate, CallOutcomeFact, PostStateFact, display_source_location
+from .candidates import BranchCandidate, CallOutcomeFact, HelperSideEffectFact, ObjectPathFact, OwnershipPathFact, PostStateFact, display_source_location
+from .ir_helper_effects import helper_effect_summary
+from .ir_ownership import ownership_facts_from_ir
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,7 @@ class CalleeGuard:
     failure_when: str
     loc:          SourceLocation | None = None
     result:       str | None = None
+    allocation_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -26,13 +29,14 @@ class CallResultAlias:
     callee: str
     args:   list[str]
     result: str | None = None
+    allocation_index: int | None = None
 
 
 def callee_guards_from_ir(func: FunctionIR) -> list[CalleeGuard]:
     guards: list[CalleeGuard] = []
-    seen: set[tuple[str, tuple[str, ...], str]] = set()
-    for guard in _callee_guards_from_statements(func.statements, {}):
-        key = (guard.callee, tuple(guard.args), guard.failure_when)
+    seen: set[tuple[str, tuple[str, ...], str, str | None, int | None]] = set()
+    for guard in _callee_guards_from_statements(func.statements, {}, allocation_start=0)[0]:
+        key = (guard.callee, tuple(guard.args), guard.failure_when, guard.result, guard.allocation_index)
         if key in seen:
             continue
         seen.add(key)
@@ -43,39 +47,80 @@ def callee_guards_from_ir(func: FunctionIR) -> list[CalleeGuard]:
 def _callee_guards_from_statements(
     statements:     list[Stmt],
     result_aliases: dict[str, CallResultAlias],
-) -> list[CalleeGuard]:
+    expr_aliases:   AliasMap | None = None,
+    allocation_start: int = 0,
+) -> tuple[list[CalleeGuard], int]:
     guards: list[CalleeGuard] = []
     current_aliases = dict(result_aliases)
+    current_expr_aliases = dict(expr_aliases or {})
+    allocation_index = allocation_start
     for stmt in statements:
         if isinstance(stmt, DeclarationStmt):
-            alias = _call_result_alias(stmt.init)
+            alias = _call_result_alias(stmt.init, allocation_index)
             if alias is not None:
-                current_aliases[stmt.name] = CallResultAlias(alias.callee, alias.args, stmt.name)
+                current_aliases[stmt.name] = CallResultAlias(
+                    alias.callee,
+                    alias.args,
+                    stmt.name,
+                    alias.allocation_index,
+                )
+            record_alias(stmt, current_expr_aliases)
+            allocation_index += _allocation_call_count(stmt.init)
             continue
-        if isinstance(stmt, AssignmentStmt) and isinstance(stmt.target, VarRef):
-            alias = _call_result_alias(stmt.value)
+        if isinstance(stmt, AssignmentStmt):
+            alias = _call_result_alias(stmt.value, allocation_index)
             if alias is not None:
-                current_aliases[stmt.target.name] = CallResultAlias(alias.callee, alias.args, stmt.target.name)
+                target = assignable_expr(stmt.target) or value_expr(stmt.target)
+                if target is not None:
+                    current_aliases[target] = CallResultAlias(alias.callee, alias.args, target, alias.allocation_index)
+            record_alias(stmt, current_expr_aliases)
+            allocation_index += _allocation_call_count(stmt.value)
         if isinstance(stmt, IfStmt):
             if body_has_return(stmt.body):
-                guard = _guard_from_condition(stmt.condition, current_aliases)
+                guard = _guard_from_condition(stmt.condition, current_aliases, current_expr_aliases)
                 if guard:
-                    guards.append(CalleeGuard(guard.callee, guard.args, guard.failure_when, stmt.loc, guard.result))
-            guards.extend(_callee_guards_from_statements(stmt.body, dict(current_aliases)))
+                    guards.append(CalleeGuard(guard.callee, guard.args, guard.failure_when, stmt.loc, guard.result, guard.allocation_index))
+            nested, nested_allocs = _callee_guards_from_statements(
+                stmt.body,
+                dict(current_aliases),
+                dict(current_expr_aliases),
+                allocation_index,
+            )
+            guards.extend(nested)
+            allocation_index = nested_allocs
         elif isinstance(stmt, LoopStmt):
-            guards.extend(_callee_guards_from_statements(stmt.body, dict(current_aliases)))
+            nested, nested_allocs = _callee_guards_from_statements(
+                stmt.body,
+                dict(current_aliases),
+                dict(current_expr_aliases),
+                allocation_index,
+            )
+            guards.extend(nested)
+            allocation_index = nested_allocs
         elif isinstance(stmt, SwitchStmt):
-            guards.extend(_callee_guards_from_statements(stmt.body, dict(current_aliases)))
-    return guards
+            nested, nested_allocs = _callee_guards_from_statements(
+                stmt.body,
+                dict(current_aliases),
+                dict(current_expr_aliases),
+                allocation_index,
+            )
+            guards.extend(nested)
+            allocation_index = nested_allocs
+    return guards, allocation_index
 
 
-def _call_result_alias(expr: Expr | None) -> CallResultAlias | None:
+def _call_result_alias(expr: Expr | None, allocation_index: int | None = None) -> CallResultAlias | None:
     if not isinstance(expr, CallExpr):
         return None
     args = _arg_texts(expr)
-    if len(args) != len(expr.args):
+    is_allocation = _is_allocation_callee(expr.callee)
+    if len(args) != len(expr.args) and not is_allocation:
         return None
-    return CallResultAlias(expr.callee, args)
+    return CallResultAlias(
+        expr.callee,
+        args,
+        allocation_index=allocation_index,
+    )
 
 
 def callee_candidates_from_ir(
@@ -88,10 +133,23 @@ def callee_candidates_from_ir(
     for guard in callee_guards_from_ir(func):
         safe = safe_name(guard.callee)
         mode = safe_name(guard.failure_when)
+        name_stem = f"ir_callee_{safe}_{mode}"
+        if guard.allocation_index is not None and _is_allocation_callee(guard.callee):
+            name_stem = f"ir_alloc_{safe}_{guard.allocation_index}_{mode}"
         source_location = display_source_location(guard.loc, f"ir:{func.name}:callee:{safe}")
+        summary = _summary_for_guard(guard, helper_irs or {}, helper_params or {})
+        failure_setup = list(summary.failure_setup)
+        failure_preamble: list[str] = []
+        if _uses_allocation_failure_control(guard, helper_irs or {}):
+            failure_setup = [
+                f"__kleva_alloc_fail_on({guard.allocation_index or 0});",
+                *failure_setup,
+            ]
+            failure_preamble = _allocator_control_preamble()
         candidates.append(BranchCandidate(
-            f"ir_callee_{safe}_{mode}_failure",
-            [],
+            f"{name_stem}_failure",
+            failure_setup,
+            failure_preamble,
             source_location=source_location,
             target_branch=f"callee {guard.callee} failure {guard.failure_when}",
             origin="ir",
@@ -101,12 +159,27 @@ def callee_candidates_from_ir(
         preamble: list[str] = []
         if setup_for_call:
             setup, preamble = setup_for_call(guard.callee, guard.args)
-        setup.extend(_helper_success_setup_from_ir(guard, helper_irs or {}, helper_params or {}))
-        success_name = f"ir_callee_{safe}_{mode}_success"
-        post_state_facts = _dedup_post_state_facts([
-            *_post_state_facts_from_setup(setup),
-            *_post_state_facts_from_helper_ir(guard, helper_irs or {}, helper_params or {}, result_alias=guard.result),
+        setup.extend(summary.success_setup)
+        if any("malloc(" in line for line in setup) and "#include <stdlib.h>" not in preamble:
+            preamble = ["#include <stdlib.h>", *preamble]
+        success_name = f"{name_stem}_success"
+        post_state_facts = _dedup_post_state_facts(
+            _post_state_facts_from_helper_ir(
+                guard,
+                helper_irs or {},
+                helper_params or {},
+                result_alias=guard.result,
+            )
+        )
+        object_paths = _dedup_object_path_facts([
+            *_object_path_facts_from_post_state(post_state_facts),
+            *_object_path_facts_from_non_null_setup(setup),
         ])
+        ownership_facts = list(summary.ownership)
+        side_effect_facts = [
+            HelperSideEffectFact(effect.kind, effect.target, effect.value, effect.evidence)
+            for effect in summary.side_effects
+        ]
         witness_setup, extra_outputs = _side_effect_witnesses(success_name, post_state_facts)
         candidates.append(BranchCandidate(
             success_name,
@@ -119,43 +192,65 @@ def callee_candidates_from_ir(
             witness_setup=witness_setup,
             extra_outputs=extra_outputs,
             call_facts=[CallOutcomeFact(guard.callee, guard.failure_when, "success")],
+            object_paths=object_paths,
+            ownership_facts=ownership_facts,
+            side_effect_facts=side_effect_facts,
             post_state_facts=post_state_facts,
         ))
     return candidates
 
 
+def _summary_for_guard(
+    guard: CalleeGuard,
+    helper_irs: dict[str, FunctionIR],
+    helper_params: dict[str, tuple[str, ...]],
+):
+    helper_ir = helper_irs.get(guard.callee)
+    param_names = helper_params.get(guard.callee, ())
+    if helper_ir is None:
+        return helper_effect_summary(FunctionIR(guard.callee, []), (), [], guard.failure_when, guard.callee)
+    return helper_effect_summary(helper_ir, param_names, guard.args, guard.failure_when, guard.callee)
+
+
 def _guard_from_condition(
     condition,
     result_aliases: dict[str, CallResultAlias] | None = None,
+    expr_aliases: AliasMap | None = None,
 ) -> CalleeGuard | None:
     result_aliases = result_aliases or {}
+    expr_aliases = expr_aliases or {}
     if isinstance(condition, UnaryOp) and condition.op == "!" and isinstance(condition.operand, CallExpr):
-        return CalleeGuard(condition.operand.callee, _arg_texts(condition.operand), "zero")
+        return CalleeGuard(condition.operand.callee, _arg_texts(condition.operand, expr_aliases), "zero")
     if isinstance(condition, UnaryOp) and condition.op == "!" and isinstance(condition.operand, VarRef):
         alias = result_aliases.get(condition.operand.name)
         if alias is not None:
-            return CalleeGuard(alias.callee, alias.args, "zero", result=alias.result)
+            return CalleeGuard(alias.callee, alias.args, "zero", result=alias.result, allocation_index=alias.allocation_index)
+    if isinstance(condition, UnaryOp) and condition.op == "!":
+        target = assignable_expr(condition.operand) or value_expr(condition.operand)
+        alias = result_aliases.get(target or "")
+        if alias is not None:
+            return CalleeGuard(alias.callee, alias.args, "zero", result=alias.result, allocation_index=alias.allocation_index)
     if isinstance(condition, BinaryOp):
         right_value = int_value(condition.right)
         if isinstance(condition.left, CallExpr) and right_value is not None:
             failure = _failure_mode(condition.op, right_value)
             if failure:
-                return CalleeGuard(condition.left.callee, _arg_texts(condition.left), failure)
+                return CalleeGuard(condition.left.callee, _arg_texts(condition.left, expr_aliases), failure)
         if isinstance(condition.left, VarRef) and right_value is not None:
             alias = result_aliases.get(condition.left.name)
             failure = _failure_mode(condition.op, right_value)
             if alias is not None and failure:
-                return CalleeGuard(alias.callee, alias.args, failure, result=alias.result)
+                return CalleeGuard(alias.callee, alias.args, failure, result=alias.result, allocation_index=alias.allocation_index)
         left_value = int_value(condition.left)
         if isinstance(condition.right, CallExpr) and left_value is not None:
             failure = _failure_mode(flipped_relation(condition.op), left_value)
             if failure:
-                return CalleeGuard(condition.right.callee, _arg_texts(condition.right), failure)
+                return CalleeGuard(condition.right.callee, _arg_texts(condition.right, expr_aliases), failure)
         if isinstance(condition.right, VarRef) and left_value is not None:
             alias = result_aliases.get(condition.right.name)
             failure = _failure_mode(flipped_relation(condition.op), left_value)
             if alias is not None and failure:
-                return CalleeGuard(alias.callee, alias.args, failure, result=alias.result)
+                return CalleeGuard(alias.callee, alias.args, failure, result=alias.result, allocation_index=alias.allocation_index)
     return None
 
 
@@ -171,14 +266,173 @@ def _failure_mode(op: str, value: int) -> str | None:
     return None
 
 
-def _arg_texts(call: CallExpr) -> list[str]:
+def _arg_texts(call: CallExpr, aliases: AliasMap | None = None) -> list[str]:
     args: list[str] = []
+    aliases = aliases or {}
     for arg in call.args:
-        text = value_expr(arg)
+        text = _fixture_arg_text(resolve_aliases(arg, aliases))
         if text is None:
             return []
         args.append(text)
     return args
+
+
+def _fixture_arg_text(expr: Expr) -> str | None:
+    if isinstance(expr, CastExpr):
+        return assignable_expr(expr.expr) or value_expr(expr.expr)
+    return value_expr(expr)
+
+
+def _is_allocation_callee(callee: str) -> bool:
+    return callee in {"malloc", "calloc", "realloc"}
+
+
+def _looks_like_allocating_helper(callee: str, helper_irs: dict[str, FunctionIR]) -> bool:
+    if callee in helper_irs and _function_contains_allocation(helper_irs[callee]):
+        return True
+    return callee.endswith(("_create", "_new", "_alloc"))
+
+
+def _uses_allocation_failure_control(guard: CalleeGuard, helper_irs: dict[str, FunctionIR]) -> bool:
+    if guard.failure_when not in {"zero", "equals_0"}:
+        return False
+    return _is_allocation_callee(guard.callee) or _looks_like_allocating_helper(guard.callee, helper_irs)
+
+
+def _function_contains_allocation(func: FunctionIR) -> bool:
+    return _allocation_call_count(func.statements) > 0
+
+
+def _allocation_call_count(value) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, CallExpr):
+        return (1 if _is_allocation_callee(value.callee) else 0) + sum(
+            _allocation_call_count(arg) for arg in value.args
+        )
+    if isinstance(value, list):
+        return sum(_allocation_call_count(item) for item in value)
+    if isinstance(value, (Expr, Stmt)):
+        return sum(_allocation_call_count(child) for child in vars(value).values())
+    return 0
+
+
+def _allocator_control_preamble() -> list[str]:
+    return [
+        "#include <stddef.h>",
+        "#include <stdint.h>",
+        "#include <string.h>",
+        "#ifdef malloc",
+        "#undef malloc",
+        "#endif",
+        "#ifdef calloc",
+        "#undef calloc",
+        "#endif",
+        "#ifdef realloc",
+        "#undef realloc",
+        "#endif",
+        "#ifdef free",
+        "#undef free",
+        "#endif",
+        "static unsigned char __kleva_alloc_arena[1024u * 1024u];",
+        "struct __kleva_alloc_rec {",
+        "    void *ptr;",
+        "    size_t size;",
+        "    int active;",
+        "};",
+        "static struct __kleva_alloc_rec __kleva_alloc_recs[1024];",
+        "static size_t __kleva_alloc_offset;",
+        "static long __kleva_alloc_call;",
+        "static long __kleva_alloc_fail_at = -1;",
+        "static void __kleva_alloc_reset(void) {",
+        "    __kleva_alloc_offset = 0;",
+        "    __kleva_alloc_call = 0;",
+        "    __kleva_alloc_fail_at = -1;",
+        "    memset(__kleva_alloc_recs, 0, sizeof(__kleva_alloc_recs));",
+        "}",
+        "static void __kleva_alloc_record(void *ptr, size_t size) {",
+        "    if (!ptr) {",
+        "        return;",
+        "    }",
+        "    for (size_t i = 0; i < sizeof(__kleva_alloc_recs) / sizeof(__kleva_alloc_recs[0]); i++) {",
+        "        if (!__kleva_alloc_recs[i].active) {",
+        "            __kleva_alloc_recs[i].ptr = ptr;",
+        "            __kleva_alloc_recs[i].size = size;",
+        "            __kleva_alloc_recs[i].active = 1;",
+        "            return;",
+        "        }",
+        "    }",
+        "}",
+        "static size_t __kleva_alloc_size_of(void *ptr) {",
+        "    for (size_t i = 0; i < sizeof(__kleva_alloc_recs) / sizeof(__kleva_alloc_recs[0]); i++) {",
+        "        if (__kleva_alloc_recs[i].active && __kleva_alloc_recs[i].ptr == ptr) {",
+        "            return __kleva_alloc_recs[i].size;",
+        "        }",
+        "    }",
+        "    return 0;",
+        "}",
+        "static void __kleva_alloc_forget(void *ptr) {",
+        "    for (size_t i = 0; i < sizeof(__kleva_alloc_recs) / sizeof(__kleva_alloc_recs[0]); i++) {",
+        "        if (__kleva_alloc_recs[i].active && __kleva_alloc_recs[i].ptr == ptr) {",
+        "            __kleva_alloc_recs[i].active = 0;",
+        "            return;",
+        "        }",
+        "    }",
+        "}",
+        "static void __kleva_alloc_fail_on(long index) {",
+        "    __kleva_alloc_fail_at = __kleva_alloc_call + index;",
+        "}",
+        "void *__kleva_malloc(size_t size) {",
+        "    if (__kleva_alloc_fail_at >= 0 && __kleva_alloc_call == __kleva_alloc_fail_at) {",
+        "        __kleva_alloc_call++;",
+        "        __kleva_alloc_fail_at = -1;",
+        "        return (void *)0;",
+        "    }",
+        "    __kleva_alloc_call++;",
+        "    if (size == 0) {",
+        "        size = 1;",
+        "    }",
+        "    size = (size + 7u) & ~((size_t)7u);",
+        "    if (size > sizeof(__kleva_alloc_arena) - __kleva_alloc_offset) {",
+        "        return (void *)0;",
+        "    }",
+        "    void *ptr = __kleva_alloc_arena + __kleva_alloc_offset;",
+        "    __kleva_alloc_offset += size;",
+        "    __kleva_alloc_record(ptr, size);",
+        "    return ptr;",
+        "}",
+        "void __kleva_free(void *ptr) {",
+        "    __kleva_alloc_forget(ptr);",
+        "}",
+        "void *__kleva_calloc(size_t count, size_t size) {",
+        "    size_t total = count * size;",
+        "    void *ptr = __kleva_malloc(total);",
+        "    if (ptr) {",
+        "        memset(ptr, 0, total);",
+        "    }",
+        "    return ptr;",
+        "}",
+        "void *__kleva_realloc(void *ptr, size_t size) {",
+        "    if (!ptr) {",
+        "        return __kleva_malloc(size);",
+        "    }",
+        "    if (size == 0) {",
+        "        __kleva_free(ptr);",
+        "        return (void *)0;",
+        "    }",
+        "    size_t old_size = __kleva_alloc_size_of(ptr);",
+        "    void *new_ptr = __kleva_malloc(size);",
+        "    if (!new_ptr) {",
+        "        return (void *)0;",
+        "    }",
+        "    if (old_size > 0) {",
+        "        size_t copy_size = old_size < size ? old_size : size;",
+        "        memcpy(new_ptr, ptr, copy_size);",
+        "    }",
+        "    __kleva_alloc_forget(ptr);",
+        "    return new_ptr;",
+        "}",
+    ]
 
 
 def _post_state_facts_from_setup(setup: list[str]) -> list[PostStateFact]:
@@ -213,6 +467,80 @@ def _post_state_facts_from_helper_ir(
             if returned_arg is not None:
                 facts.extend(_facts_for_return_alias(facts, returned_arg, result_alias))
     return _dedup_post_state_facts(facts)
+
+
+def _ownership_facts_from_helper_ir(
+    guard: CalleeGuard,
+    helper_irs: dict[str, FunctionIR],
+    helper_params: dict[str, tuple[str, ...]],
+) -> list[OwnershipPathFact]:
+    helper_ir = helper_irs.get(guard.callee)
+    param_names = helper_params.get(guard.callee, ())
+    if helper_ir is None or len(param_names) != len(guard.args):
+        return []
+
+    arg_by_param = dict(zip(param_names, guard.args))
+    facts: list[OwnershipPathFact] = []
+    seen: set[OwnershipPathFact] = set()
+    for fact in ownership_facts_from_ir(helper_ir, set(param_names)):
+        target = _map_param_target(fact.param, arg_by_param)
+        if target is None:
+            continue
+        mapped = OwnershipPathFact(target, fact.action, f"{guard.callee}:{fact.target}")
+        if mapped in seen:
+            continue
+        seen.add(mapped)
+        facts.append(mapped)
+    return facts
+
+
+def _object_path_facts_from_post_state(facts: list[PostStateFact]) -> list[ObjectPathFact]:
+    out: list[ObjectPathFact] = []
+    for fact in facts:
+        parsed = _parse_object_path(fact.target)
+        if parsed is None:
+            continue
+        root, path = parsed
+        out.append(ObjectPathFact(root, path))
+    return _dedup_object_path_facts(out)
+
+
+def _object_path_facts_from_non_null_setup(setup: list[str]) -> list[ObjectPathFact]:
+    import re
+
+    facts: list[ObjectPathFact] = []
+    pattern = re.compile(r"/\*\s*kleva:\s*non-null pointer path\s+(.+?)\s+backed by fixture\s*\*/")
+    for line in setup:
+        match = pattern.fullmatch(line.strip())
+        if not match:
+            continue
+        parsed = _parse_object_path(match.group(1))
+        if parsed is None:
+            continue
+        root, path = parsed
+        facts.append(ObjectPathFact(root, path))
+    return _dedup_object_path_facts(facts)
+
+
+def _dedup_object_path_facts(facts: list[ObjectPathFact]) -> list[ObjectPathFact]:
+    out: list[ObjectPathFact] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for fact in facts:
+        key = (fact.root, fact.path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fact)
+    return out
+
+
+def _parse_object_path(target: str) -> tuple[str, tuple[str, ...]] | None:
+    import re
+
+    parts = re.findall(r"(?:^|->|\.)([A-Za-z_]\w*)(?:\s*\[\s*\d+\s*\])?", target)
+    if len(parts) < 2:
+        return None
+    return parts[0], tuple(parts[1:])
 
 
 def _helper_success_setup_from_ir(
@@ -260,6 +588,8 @@ def _setup_for_false_condition(expr: Expr, arg_by_param: dict[str, str]) -> list
     if isinstance(expr, UnaryOp) and expr.op == "!":
         target = _mapped_assignable(expr.operand, arg_by_param)
         if target:
+            if is_pointer_expr(expr.operand):
+                return [f"/* kleva: non-null pointer path {target} backed by fixture */"]
             return [f"{target} = 1;"]
         return []
 

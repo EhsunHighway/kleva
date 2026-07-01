@@ -4,6 +4,7 @@ import re
 
 from ..ast.model import CFunction, CFunctionPointerTypedef, CParam, CTypeCatalog
 from ..ast.source_query import camel_to_snake, lower_first, visible_function
+from .requirements import FixtureRequirement, FixtureRequirementKind, first_requirement, has_requirement
 
 
 def safe_c_name(text: str) -> str:
@@ -25,6 +26,16 @@ def unique_name(preferred: str, used_names: set[str]) -> str:
 
 def is_void_star(p: CFunction | CParam) -> bool:
     return p.base_type == "void" and getattr(p, "is_pointer", False)
+
+
+def is_char_pointer(p: CParam) -> bool:
+    return p.is_pointer and p.base_type == "char"
+
+
+def safe_buffer_size(size: str | None) -> str:
+    if size and re.fullmatch(r"\d+|[A-Z][A-Z0-9_]*", size):
+        return size
+    return "64"
 
 
 def lookup_constructor(
@@ -345,21 +356,55 @@ def pointer_argument_setup(
     suppress_constructor_guard: bool = False,
     prefer_raw_heap: bool = False,
     required_paths: list[tuple[str, ...]] | None = None,
+    requirements: list[FixtureRequirement] | None = None,
 ) -> tuple[list[str], str, list[str]]:
     """Generate setup lines, call argument, and cleanup for one pointer param."""
-    used_names = used_names or set()
+    if used_names is None:
+        used_names = set()
     if is_void_star(p):
         return [], "NULL", []
 
     var_name = unique_name(preferred_name or p.name, used_names)
-    if p.base_type == "uint8_t":
+    if is_char_pointer(p) and has_requirement(
+        requirements,
+        p.name,
+        FixtureRequirementKind.STRING_BUFFER,
+    ):
         buf_name = unique_name(f"{var_name}_buf", used_names)
+        raw_type = p.raw_type.strip()
+        if p.name and re.search(rf"\b{re.escape(p.name)}\b", raw_type):
+            raw_type = re.sub(rf"\b{re.escape(p.name)}\b", var_name, raw_type)
+        elif not re.search(rf"\b{re.escape(var_name)}\b", raw_type):
+            raw_type = f"{raw_type} {var_name}"
         return (
             [
-                f"uint8_t {buf_name}[64];",
-                f"memset({buf_name}, 0, sizeof({buf_name}));",
+                f"char {buf_name}[] = \"kleva\";",
+                f"{raw_type} = {buf_name};",
             ],
-            buf_name,
+            var_name,
+            [],
+        )
+
+    if p.base_type == "uint8_t":
+        requirement = first_requirement(
+            requirements,
+            p.name,
+            FixtureRequirementKind.BYTE_BUFFER,
+        )
+        buffer_size = safe_buffer_size(requirement.size if requirement else None)
+        buf_name = unique_name(f"{var_name}_buf", used_names)
+        raw_type = p.raw_type.strip()
+        if p.name and re.search(rf"\b{re.escape(p.name)}\b", raw_type):
+            raw_type = re.sub(rf"\b{re.escape(p.name)}\b", var_name, raw_type)
+        elif not re.search(rf"\b{re.escape(var_name)}\b", raw_type):
+            raw_type = f"{raw_type} {var_name}"
+        return (
+            [
+                f"uint8_t {buf_name}[{buffer_size}];",
+                *_byte_buffer_content_lines(buf_name, f"sizeof({buf_name})", requirement.content if requirement else None),
+                f"{raw_type} = {buf_name};",
+            ],
+            var_name,
             [],
         )
 
@@ -415,7 +460,18 @@ def pointer_argument_setup(
         )
 
     return (
-        [f"/* kleva synth: no visible allocation strategy for {p.base_type} *{p.name}; using NULL */"],
+        [f"/* fixture-failed: unknown allocator for {p.base_type} *{p.name}; using NULL */"],
         "NULL",
         [],
     )
+
+
+def _byte_buffer_content_lines(buffer_expr: str, size_expr: str, content: str | None) -> list[str]:
+    if content == "all-0xff":
+        return [f"memset({buffer_expr}, 0xFF, {size_expr});"]
+    if content == "first-byte-set":
+        return [
+            f"memset({buffer_expr}, 0, {size_expr});",
+            f"if ({size_expr} > 0) {buffer_expr}[0] = 1;",
+        ]
+    return [f"memset({buffer_expr}, 0, {size_expr});"]

@@ -29,6 +29,7 @@ src/kleva/
   codegen.py
   config.py
   eva.py
+  kernel/
   klee.py
   ktest.py
   pipeline.py
@@ -96,6 +97,153 @@ example a branch fact such as `ctx->state case 1` or a call outcome such as
 `prepare equals_-1 success`.
 
 Touch this module when changing the test-plan schema.
+
+## `bodygen.py`
+
+Builds concrete C bodies for KLEE harnesses, EVA probes, trusted unit tests,
+and diagnostic unit tests.
+
+Important responsibilities:
+
+- construct arguments and fixtures from ACSL, IR facts, and fixture
+  requirements
+- emit meaningful post-call witnesses from ACSL old-state contracts, typed IR
+  assignments, callback witnesses, and helper side effects
+- ignore post-call witnesses whose expected value depends on a callee-local
+  variable that is not visible in the generated harness
+- mark missing observables with `oracle-missing:` instead of generating weak
+  `out_ok` placeholders
+
+Touch this module when changing how candidates become concrete C setup code or
+when adding a new kind of observable.
+
+## `codegen.py`
+
+Writes probe drivers, trusted unit tests, KLEE harnesses, and unproved
+diagnostic artifacts.
+
+Trusted tests only contain EVA-proven singleton assertions. Candidates whose
+outputs are not fully proved are kept out of trusted tests and, when requested,
+are emitted separately with reason categories:
+
+- `weak_fixture`
+- `weak_oracle`
+- `missing_acsl`
+- `eva_imprecision`
+- `implementation_bug`
+- `timeout`
+
+Touch this module when changing trusted-vs-diagnostic policy, unproved reports,
+or the final C file layout.
+
+## `shaping/ir_helper_effects.py`
+
+Generic helper-effect summaries from typed IR.
+
+Important dataclasses:
+
+- `HelperEffectSummary`
+- `HelperSideEffect`
+
+The summary layer infers helper behavior that caller candidates can request:
+
+- success and failure fixture setup from helper guard conditions
+- field assignment side effects
+- array-slot assignment side effects
+- generic call side effects
+- post-state facts
+- ownership transfer or consumption facts
+
+This module must stay domain-neutral. It should describe C shapes such as
+assignments, calls, and guarded returns, not names such as TCP, packet, event,
+or queue.
+
+## `shaping/ir_switches.py`
+
+Generic switch and state-machine shaping from typed IR.
+
+Important function:
+
+- `state_switch_candidates_from_ir(...)`
+
+This shaper recognizes enum-like control fields by shape:
+
+- a switch selector such as `obj->state`
+- cases for possible source states
+- assignments back to the same selector as transitions
+- guard conditions inside cases
+- helper calls whose summaries assign the selector
+
+Generated transition candidates include `transition` candidate facts with the
+selector, source state, target state, and optional guard/helper explanation.
+The shaper must not know TCP, scheduler, or protocol names.
+
+## `shaping/diversity.py`
+
+Generic curated value/content diversity shaper.
+
+Important function:
+
+- `curated_diversity_candidates(...)`
+
+This shaper adds a small number of optional candidates for API input variation:
+
+- selected scalar boundary values, one scalar parameter at a time
+- byte-buffer content patterns:
+  - all zero
+  - all `0xff`
+  - first byte set
+- length-like boundary values such as `0`, `1`, and `2`
+
+It deliberately avoids Cartesian-product generation. Each candidate changes one
+input dimension and carries `diversity` candidate facts, so KLEE/EVA still
+decide whether the candidate becomes a trusted test.
+
+Scalar diversity is represented with concrete call-argument overrides. Do not
+emit setup assignments for these values; setup assignments allow KLEE to keep
+the original argument symbolic and can multiply recipes. Unknown typedefs and
+function-pointer parameters are not scalar-diversity targets.
+
+Scalar diversity is also contract-aware. If the active ACSL assumptions require
+`len > 0`, `n != 0`, `x <= 8`, or the flipped equivalent such as `0 < len`,
+the shaper filters out boundary values that violate those assumptions. Invalid
+contract exploration belongs in a separate diagnostic mode, not in normal
+trusted-path diversity.
+
+## `kernel/`
+
+Static-analysis kernel facade.
+
+Important dataclasses:
+
+- `ProgramInput`
+- `ProgramModel`
+
+Important function:
+
+- `build_program_model(...)`
+
+The kernel gathers the shared facts that later KLEVA stages should consume:
+
+- public functions from the header
+- ACSL contracts
+- visible source text for explicit fallback paths
+- Clang-derived function IR
+- Clang-derived function declarations
+- Clang-derived type catalog
+- fallback diagnostics
+
+`ProgramModel` is also the query facade for synthesis code. Use methods such
+as `function_ir`, `function_decl`, `accepts_null_param`, and
+`fallback_fact_dicts` instead of reaching directly into parser helpers or
+source-text fallback helpers from orchestration code.
+
+This package is the boundary between raw input files and analysis modules.
+Shapers, fixture construction, and synthesis orchestration should ask the
+kernel for typed facts instead of independently parsing source files.
+
+Touch this package when adding shared front-end facts or changing how KLEVA
+decides whether it is using typed IR or source-text fallback behavior.
 
 ## `acsl.py`
 
@@ -190,8 +338,9 @@ Generated YAML reports fallback use in the header:
 - `# Fallbacks: none`
 - `# Fallbacks: used`
 
-When fallback is used, `kleva synth` prints a warning and `--ir-diagnostics`
-records `source-fallback` entries.
+When fallback is used, `kleva synth` prints a warning, `--ir-diagnostics`
+records `source-fallback` entries, and emitted test-plan entries include
+fallback `candidate_facts` so fallback use is visible per function or candidate.
 
 ## `augment.py`
 
@@ -385,6 +534,23 @@ Important functions:
 EVA singleton values are the source of generated unit-test oracles.
 
 Touch this module when changing Frama-C invocation or singleton parsing.
+
+## `quality_report.py`
+
+Generated-test quality reporting.
+
+It scans generated unit-test artifacts and reports:
+
+- trusted tests
+- trusted assertions
+- EVA-proven assertions
+- unproved diagnostics
+- skipped candidates
+- runtime from summary JSON files
+
+It also provides `compare_generated_tests_by_api(...)` for comparing older and
+newer generated unit files by explicit public API names. API names are supplied
+by the caller instead of guessed from underscores in test names.
 
 ## `refiner.py`
 

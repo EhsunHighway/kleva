@@ -274,6 +274,21 @@ def _parse_block_behaviors(block: str) -> list[ACSLBehavior]:
                 current.assigns = rest
             continue
 
+    return _propagate_global_requires(behaviors)
+
+
+def _propagate_global_requires(behaviors: list[ACSLBehavior]) -> list[ACSLBehavior]:
+    if len(behaviors) < 2:
+        return behaviors
+    global_behavior = behaviors[0]
+    if (
+        global_behavior.name != "valid"
+        or not global_behavior.assumes
+        or global_behavior.ensures
+    ):
+        return behaviors
+    for behavior in behaviors[1:]:
+        behavior.assumes = [*global_behavior.assumes, *behavior.assumes]
     return behaviors
 
 

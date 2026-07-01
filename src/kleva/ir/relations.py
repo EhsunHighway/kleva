@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from .model import Expr, IntLiteral, UnaryOp
+from .model import CastExpr, Expr, IntLiteral, UnaryOp
 
 
 def int_value(expr: Expr) -> int | None:
     if isinstance(expr, IntLiteral):
         return expr.value
+    if isinstance(expr, CastExpr):
+        return int_value(expr.expr)
     if isinstance(expr, UnaryOp) and expr.op == "-":
         value = int_value(expr.operand)
         if value is not None:

@@ -4,6 +4,20 @@ from kleva.config import load_config_text
 
 
 class ConfigTests(unittest.TestCase):
+    def test_loads_source_included_module_flag(self):
+        cfg = load_config_text(
+            """
+module:
+  name: mod
+  header: /tmp/mod.c
+  source: mod.c
+  source_included: true
+functions: []
+"""
+        )
+
+        self.assertTrue(cfg.source_included)
+
     def test_loads_candidate_facts(self):
         cfg = load_config_text(
             """

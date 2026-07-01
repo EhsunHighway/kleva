@@ -24,9 +24,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .config import FunctionSpec, InputSpec
-from .recipe import Recipe, expand_guard
+from .eva import EvaReport
+from .recipe import Recipe, allocator_redirect_macros_for_lines, expand_guard
 
 
 @dataclass(frozen=True)
@@ -113,10 +115,20 @@ def _drop_local_typedefs(lines: list[str]) -> list[str]:
     return out
 
 
+def _recipe_uses_allocator_control(recipe: Recipe) -> bool:
+    return bool(allocator_redirect_macros_for_lines(recipe.preamble, recipe.body_lines))
+
+
+def _recipes_use_allocator_control(recipes: list[Recipe]) -> bool:
+    return any(_recipe_uses_allocator_control(recipe) for recipe in recipes)
+
+
 def _probe_fn(recipe: Recipe) -> tuple[str, str]:
     """Return (C source, function name) for one probe function."""
     fn    = "probe_" + recipe.fn_id
     lines = [f"static void {fn}(void) {{"]
+    if _recipe_uses_allocator_control(recipe):
+        lines.append("    __kleva_alloc_reset();")
     for line in recipe.decl_lines:
         lines.append("    " + line)
     for line in _drop_local_typedefs(recipe.body_lines):
@@ -141,6 +153,8 @@ def _unit_fn(
     unproven: list[str] = []
 
     lines = [f"static void {fn}(void) {{"]
+    if _recipe_uses_allocator_control(recipe):
+        lines.append("    __kleva_alloc_reset();")
     for line in recipe.decl_lines:
         lines.append("    " + line)
     for line in _drop_local_typedefs(recipe.body_lines):
@@ -166,6 +180,7 @@ def _diagnostic_unit_fn(
     recipe:     Recipe,
     singletons: dict[str, int],
     unproven:   list[str],
+    eva_report: Optional[EvaReport] = None,
 ) -> tuple[str, str]:
     """
     Return (C source, fn_name) for an unproved diagnostic test.
@@ -176,7 +191,8 @@ def _diagnostic_unit_fn(
     bug.
     """
     fn = "test_" + recipe.fn_id
-    classification = _classify_unproved(recipe, singletons, unproven)
+    probe_fn = "probe_" + recipe.fn_id
+    classification = _classify_unproved(recipe, singletons, unproven, eva_report, probe_fn)
     klee_diag = _klee_diagnostic(recipe)
     lines = [
         f"/*",
@@ -188,12 +204,15 @@ def _diagnostic_unit_fn(
         f" * Target branch: {_diagnostic_value(recipe.target_branch)}",
         f" * Candidate origin: {_diagnostic_value(recipe.candidate_origin)}",
         f" * Candidate facts: {_diagnostic_facts(recipe.candidate_facts)}",
+        f" * EVA raw log: {_diagnostic_value(eva_report.raw_log_path if eva_report else None)}",
         f" * Missing singleton output(s): {', '.join(unproven)}",
         f" * Reason category: {classification.category}",
         f" * Reason note: {classification.note}",
         f" */",
         f"static void {fn}(void) {{",
     ]
+    if _recipe_uses_allocator_control(recipe):
+        lines.append("    __kleva_alloc_reset();")
     for line in recipe.decl_lines:
         lines.append("    " + line)
     for line in _drop_local_typedefs(recipe.body_lines):
@@ -250,14 +269,33 @@ def _classify_unproved(
     recipe:     Recipe,
     singletons: dict[str, int],
     unproven:   list[str],
+    eva_report: Optional[EvaReport] = None,
+    probe_fn:   str | None = None,
 ) -> UnprovedClassification:
+    if eva_report is not None:
+        report_classification = _classify_unproved_from_eva(eva_report, probe_fn or ("probe_" + recipe.fn_id), unproven)
+        if report_classification is not None:
+            return report_classification
+
     text = "\n".join([*recipe.decl_lines, *recipe.body_lines, *recipe.cleanup, *recipe.preamble])
     lower = text.lower()
 
-    if "kleva synth:" in lower or "no visible allocation strategy" in lower or "using null" in lower:
+    if "timeout" in lower or "eva-timeout" in lower or "eva timeout" in lower:
         return UnprovedClassification(
-            "fixture_gap",
+            "timeout",
+            "tool execution or generated metadata indicates a timeout before the oracle could be proved",
+        )
+
+    if "fixture-failed:" in lower or "kleva synth:" in lower or "no visible allocation strategy" in lower or "using null" in lower:
+        return UnprovedClassification(
+            "weak_fixture",
             "generated setup contains a visible fixture fallback or missing allocation strategy",
+        )
+
+    if "oracle-missing:" in lower or "out_missing_oracle" in unproven:
+        return UnprovedClassification(
+            "weak_oracle",
+            "candidate executed but KLEVA found no meaningful return value, post-state, callback, or side-effect witness to assert",
         )
 
     missing_assignments = [
@@ -266,8 +304,8 @@ def _classify_unproved(
     ]
     if missing_assignments:
         return UnprovedClassification(
-            "missing_contract_or_observable",
-            f"requested output is not visibly assigned or declared in the generated probe: {', '.join(missing_assignments)}",
+            "missing_acsl",
+            f"requested output is not visibly assigned or declared; a contract or shaper-supplied witness is probably missing: {', '.join(missing_assignments)}",
         )
 
     if singletons:
@@ -278,14 +316,78 @@ def _classify_unproved(
 
     if any(var in {"out_ret", "ret", "result"} or var.endswith("_ret") for var in unproven):
         return UnprovedClassification(
-            "possible_implementation_bug",
+            "implementation_bug",
             "return-value output stayed unproved for this concrete candidate; review the path for missing setup or unexpected behavior",
         )
 
     return UnprovedClassification(
-        "eva_imprecision_or_missing_contract",
-        "no specific fixture or observable-shape issue was detected from the generated recipe",
+        "eva_imprecision",
+        "no fixture, oracle-shape, or missing-contract marker was detected from the generated recipe",
     )
+
+
+def _classify_unproved_from_eva(
+    report:   EvaReport,
+    probe_fn: str,
+    unproven: list[str],
+) -> Optional[UnprovedClassification]:
+    if report.timed_out:
+        return UnprovedClassification(
+            "timeout",
+            "EVA timed out before producing a complete final-state report",
+        )
+
+    if report.parse_errors:
+        return UnprovedClassification(
+            "invalid_generated_c",
+            "; ".join(report.parse_errors[:2]),
+        )
+
+    if report.alarms:
+        return UnprovedClassification(
+            "eva_alarm",
+            "; ".join(report.alarms[:2]),
+        )
+
+    if report.preconditions.invalid:
+        return UnprovedClassification(
+            "invalid_precondition",
+            f"EVA reported {report.preconditions.invalid} invalid precondition(s)",
+        )
+
+    if report.preconditions.unknown:
+        return UnprovedClassification(
+            "unknown_precondition",
+            f"EVA reported {report.preconditions.unknown} unknown precondition(s)",
+        )
+
+    if not report.has_final_state(probe_fn):
+        return UnprovedClassification(
+            "target_not_reached",
+            "EVA did not report a final state for the probe function; the fixture may abort, return early, or fail before outputs are assigned",
+        )
+
+    values = report.values_for(probe_fn)
+    nodes = report.value_nodes_for(probe_fn)
+    missing = [var for var in unproven if var not in values]
+    if missing:
+        return UnprovedClassification(
+            "missing_output",
+            f"EVA reached the probe, but these requested outputs are absent from the final state: {', '.join(missing)}",
+        )
+
+    non_singleton = [var for var in unproven if var in values and var not in report.singletons_for(probe_fn)]
+    if non_singleton:
+        rendered = ", ".join(
+            f"{var}={nodes[var].raw} ({nodes[var].kind})" if var in nodes else f"{var}={values[var]}"
+            for var in non_singleton[:3]
+        )
+        return UnprovedClassification(
+            "non_singleton_output",
+            f"EVA found the output(s), but they are not exact singleton values: {rendered}",
+        )
+
+    return None
 
 
 def _looks_assigned_or_declared(var: str, recipe: Recipe) -> bool:
@@ -309,7 +411,15 @@ def _dedup_preamble_blocks(recipes: list[Recipe]) -> list[str]:
         while i < len(r.preamble):
             line = r.preamble[i]
             block = [line]
-            if line.startswith("static ") and line.rstrip().endswith("{"):
+            if line.strip().startswith("#if"):
+                i += 1
+                while i < len(r.preamble):
+                    block.append(r.preamble[i])
+                    if r.preamble[i].strip() == "#endif":
+                        i += 1
+                        break
+                    i += 1
+            elif line.rstrip().endswith("{"):
                 depth = line.count("{") - line.count("}")
                 i += 1
                 while i < len(r.preamble) and depth > 0:
@@ -325,6 +435,26 @@ def _dedup_preamble_blocks(recipes: list[Recipe]) -> list[str]:
                 out.extend(block)
 
     return out
+
+
+def _native_compile_flag_lines(recipes: list[Recipe]) -> list[str]:
+    macros: list[str] = []
+    seen: set[str] = set()
+    for recipe in recipes:
+        for macro in allocator_redirect_macros_for_lines(recipe.preamble, recipe.body_lines):
+            if macro in seen:
+                continue
+            seen.add(macro)
+            macros.append(macro)
+    if not macros:
+        return []
+    return [
+        "/* KLEVA native compile note:",
+        " * This generated test includes allocator-failure candidates.",
+        " * Compile the module-under-test with:",
+        " *   " + " ".join(f"-D{macro}" for macro in macros),
+        " */",
+    ]
 
 
 def write_probe_driver(
@@ -396,6 +526,7 @@ def write_unit_tests(
     header:              str,
     ts:                  str | None = None,
     emit_unproved:       str = "off",
+    eva_reports_by_probe: dict[str, EvaReport] | None = None,
 ) -> tuple[int, int, int]:
     """
     Write the unit test C file.
@@ -413,22 +544,25 @@ def write_unit_tests(
     report_lines: list[str] = []
     total_proven = total_unproven = skipped_candidates = 0
     emit_unproved = emit_unproved or "off"
+    eva_reports_by_probe = eva_reports_by_probe or {}
     if emit_unproved not in {"off", "report", "tests", "all"}:
         raise ValueError(f"unknown emit_unproved mode: {emit_unproved}")
 
     for r in recipes:
         probe_fn   = "probe_" + r.fn_id
         singletons = singletons_by_probe.get(probe_fn, {})
+        eva_report = eva_reports_by_probe.get(probe_fn)
         body, fn, proven, unproven = _unit_fn(r, singletons)
         if unproven:
-            if r.candidate:
+            if r.candidate or emit_unproved in {"report", "tests", "all"}:
                 total_unproven += len(unproven)
                 if emit_unproved in {"report", "tests", "all"}:
-                    classification = _classify_unproved(r, singletons, unproven)
+                    classification = _classify_unproved(r, singletons, unproven, eva_report, probe_fn)
                     klee_diag = _klee_diagnostic(r)
                     report_lines.append(
                         f"- {r.fn_id}: EVA_UNPROVED missing={', '.join(unproven)} "
                         f"klee_status={klee_diag.status} klee_artifact={klee_diag.artifact} "
+                        f"eva_log={_diagnostic_value(eva_report.raw_log_path if eva_report else None)} "
                         f"source_location={_diagnostic_value(r.source_location)} "
                         f"target_branch={_diagnostic_value(r.target_branch)} "
                         f"candidate_origin={_diagnostic_value(r.candidate_origin)} "
@@ -436,7 +570,7 @@ def write_unit_tests(
                         f"reason={classification.category} note={classification.note}"
                     )
                 if emit_unproved in {"tests", "all"}:
-                    diag_body, diag_fn = _diagnostic_unit_fn(r, singletons, unproven)
+                    diag_body, diag_fn = _diagnostic_unit_fn(r, singletons, unproven, eva_report)
                     diagnostic_bodies.append(diag_body)
                     diagnostic_fn_names.append(diag_fn)
                 else:
@@ -454,6 +588,12 @@ def write_unit_tests(
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(_UNIT_HEADER.format(ts=ts, header=header))
+        uses_allocator_control = _recipes_use_allocator_control(recipes)
+        native_compile_flags = _native_compile_flag_lines(recipes)
+        for line in native_compile_flags:
+            f.write(line + "\n")
+        if native_compile_flags:
+            f.write("\n")
         # Emit preamble declarations (static helpers, etc.) deduplicated.
         preamble_lines = _dedup_preamble_blocks(recipes)
         if preamble_lines:
@@ -463,6 +603,8 @@ def write_unit_tests(
         f.write("\n\n".join(bodies))
         f.write("\n\nint main(void) {\n")
         for fn in fn_names:
+            if uses_allocator_control:
+                f.write("    __kleva_alloc_reset();\n")
             f.write(f"    {fn}();\n")
         f.write('\n    printf("\\nAll unit tests passed.\\n");\n')
         f.write("    return 0;\n}\n")
@@ -475,13 +617,19 @@ def write_unit_tests(
             f.write("These candidates were generated and checked, but EVA did not prove all requested singleton outputs.\n\n")
             for line in report_lines:
                 f.write(line + "\n")
+    elif emit_unproved in {"report", "all"}:
+        report_path = Path(_unproved_report_path(path))
+        if report_path.exists():
+            report_path.unlink()
 
     if diagnostic_bodies:
         diagnostic_path = _unproved_test_path(path)
+        diagnostic_recipes = [r for r in recipes if r.candidate]
+        uses_allocator_control = _recipes_use_allocator_control(diagnostic_recipes)
         Path(diagnostic_path).parent.mkdir(parents=True, exist_ok=True)
         with open(diagnostic_path, "w") as f:
             f.write(_UNPROVED_HEADER.format(ts=ts, header=header))
-            preamble_lines = _dedup_preamble_blocks([r for r in recipes if r.candidate])
+            preamble_lines = _dedup_preamble_blocks(diagnostic_recipes)
             if preamble_lines:
                 for line in preamble_lines:
                     f.write(line + "\n")
@@ -489,9 +637,15 @@ def write_unit_tests(
             f.write("\n\n".join(diagnostic_bodies))
             f.write("\n\nint main(void) {\n")
             for fn in diagnostic_fn_names:
+                if uses_allocator_control:
+                    f.write("    __kleva_alloc_reset();\n")
                 f.write(f"    {fn}();\n")
             f.write('\n    printf("\\nDiagnostic unproved candidate tests ran.\\n");\n')
             f.write("    return 0;\n}\n")
+    elif emit_unproved in {"tests", "all"}:
+        diagnostic_path = Path(_unproved_test_path(path))
+        if diagnostic_path.exists():
+            diagnostic_path.unlink()
 
     return total_proven, total_unproven, skipped_candidates
 

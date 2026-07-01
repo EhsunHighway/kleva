@@ -4,7 +4,9 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
+from ..ir.aliases import AliasMap, record_alias, resolve_aliases
 from ..ir.model import BinaryOp, CallExpr, Expr, FunctionIR, IfStmt, LoopStmt, ReturnStmt, Stmt, SwitchStmt
+from ..ir.model import DeclarationStmt
 from ..ir.relations import flipped_relation, int_value, relation_name
 from ..ir.render import assignable_expr, value_expr
 from ..ir.walk import body_has_return, walk_if_statements
@@ -59,10 +61,12 @@ def parser_candidates_from_ir(func: FunctionIR, ops: IrParserOps) -> list[Branch
     candidates: list[BranchCandidate] = []
     seen: set[str] = set()
 
-    for index, (stmt, continuation_facts) in enumerate(_parser_guard_statements(func.statements)):
+    for index, (stmt, condition, local_names, continuation_facts) in enumerate(_parser_guard_statements(func.statements)):
         if not _returns_from_guard(stmt):
             continue
-        for guard in _numeric_guards(stmt.condition):
+        for guard in _numeric_guards(condition):
+            if _target_references_local_root(guard.target, local_names):
+                continue
             for label, value in _boundary_values(guard):
                 family = _numeric_family(guard)
                 name = ops.safe_c_name(f"ir_{family}_{index}_{guard.target}_{relation_name(guard.op)}_{guard.value}_{label}")
@@ -78,7 +82,9 @@ def parser_candidates_from_ir(func: FunctionIR, ops: IrParserOps) -> list[Branch
                     object_paths=continuation_facts,
                     branch_facts=[BranchFact(guard.target, "==", str(value))],
                 ))
-        for guard in _equality_guards(stmt.condition):
+        for guard in _equality_guards(condition):
+            if _target_references_local_root(guard.target, local_names):
+                continue
             for label, value in _equality_values(guard):
                 family = _equality_family(guard)
                 name = ops.safe_c_name(f"ir_{family}_{index}_{guard.target}_{relation_name(guard.op)}_{guard.value}_{label}")
@@ -94,7 +100,7 @@ def parser_candidates_from_ir(func: FunctionIR, ops: IrParserOps) -> list[Branch
                     object_paths=continuation_facts,
                     branch_facts=[BranchFact(guard.target, "==", str(value))],
                 ))
-        for guard in _call_guards(stmt.condition):
+        for guard in _call_guards(condition):
             safe_callee = ops.safe_c_name(guard.callee)
             for label in ("success", "failure"):
                 name = ops.safe_c_name(f"ir_call_guard_{index}_{safe_callee}_{relation_name(guard.op)}_{guard.value}_{label}")
@@ -115,17 +121,55 @@ def parser_candidates_from_ir(func: FunctionIR, ops: IrParserOps) -> list[Branch
     return candidates
 
 
-def _parser_guard_statements(statements: list[Stmt]) -> list[tuple[IfStmt, list[ObjectPathFact]]]:
-    found: list[tuple[IfStmt, list[ObjectPathFact]]] = []
+def _parser_guard_statements(
+    statements: list[Stmt],
+    aliases: AliasMap | None = None,
+    local_names: set[str] | None = None,
+) -> list[tuple[IfStmt, Expr, set[str], list[ObjectPathFact]]]:
+    found: list[tuple[IfStmt, Expr, set[str], list[ObjectPathFact]]] = []
+    current_aliases = dict(aliases or {})
+    current_locals = set(local_names or set())
     for index, stmt in enumerate(statements):
+        if isinstance(stmt, DeclarationStmt):
+            current_locals.add(stmt.name)
+        record_alias(stmt, current_aliases)
         if isinstance(stmt, IfStmt):
-            found.append((stmt, _object_path_facts_from_statements(statements[index + 1:])))
-            found.extend(_parser_guard_statements(stmt.body))
+            found.append((
+                stmt,
+                resolve_aliases(stmt.condition, current_aliases),
+                set(current_locals),
+                _object_path_facts_from_statements(statements[index + 1:]),
+            ))
+            found.extend(_parser_guard_statements(stmt.body, dict(current_aliases), set(current_locals)))
         elif isinstance(stmt, LoopStmt):
-            found.extend(_parser_guard_statements(stmt.body))
+            found.extend(_parser_guard_statements(stmt.body, dict(current_aliases), set(current_locals)))
         elif isinstance(stmt, SwitchStmt):
-            found.extend(_parser_guard_statements(stmt.body))
+            found.extend(_parser_guard_statements(stmt.body, dict(current_aliases), set(current_locals)))
     return found
+
+
+def _target_references_local_root(target: str, local_names: set[str]) -> bool:
+    if not local_names:
+        return False
+    root = _assignment_root(target)
+    if root in local_names:
+        return True
+    for name in local_names:
+        escaped = re.escape(name)
+        if re.search(rf"(?<![A-Za-z0-9_>.])\(?{escaped}\)?\s*(?:->|\.|\[)", target):
+            return True
+    return False
+
+
+def _assignment_root(target: str) -> str | None:
+    lhs = target.strip().lstrip("*& ")
+    while True:
+        casted = re.match(r"^\(\([^)]*\)\)\s*(.*)$", lhs)
+        if not casted:
+            break
+        lhs = casted.group(1).lstrip("*& ")
+    match = re.match(r"([A-Za-z_]\w*)", lhs)
+    return match.group(1) if match else None
 
 
 def _object_path_facts_from_statements(statements: list[Stmt]) -> list[ObjectPathFact]:

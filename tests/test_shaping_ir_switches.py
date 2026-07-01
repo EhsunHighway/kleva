@@ -1,8 +1,8 @@
 import unittest
 
 from kleva.fixtures.construction import safe_c_name
-from kleva.ir.model import AddressOf, ArraySubscript, AssignmentStmt, BinaryOp, CallExpr, CastExpr, DeclarationStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, ReturnStmt, SourceLocation, SwitchCase, SwitchStmt, VarRef
-from kleva.shaping.candidates import BranchFact, ObjectPathFact
+from kleva.ir.model import AddressOf, ArraySubscript, AssignmentStmt, BinaryOp, CallExpr, CastExpr, DeclarationStmt, ExprStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, ReturnStmt, SourceLocation, SwitchCase, SwitchStmt, VarRef
+from kleva.shaping.candidates import BranchFact, ObjectPathFact, PostStateFact, StateTransitionFact
 from kleva.shaping.ir_conditions import IrConditionOps
 from kleva.shaping.ir_switches import state_switch_candidates_from_ir
 
@@ -38,6 +38,33 @@ class IrSwitchShapingTests(unittest.TestCase):
         )
         self.assertEqual(candidates[0].source_location, "sample.c:20:9")
         self.assertEqual(candidates[0].target_branch, "switch ctx->state case 1")
+
+    def test_switch_case_candidate_records_direct_body_assignment_post_state(self):
+        func = FunctionIR(
+            "run",
+            [
+                SwitchStmt(
+                    FieldAccess(VarRef("ctx"), "state"),
+                    [
+                        SwitchCase(
+                            1,
+                            [
+                                AssignmentStmt(
+                                    FieldAccess(VarRef("ctx"), "ready"),
+                                    IntLiteral(1),
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        candidates = state_switch_candidates_from_ir(func)
+
+        self.assertEqual(candidates[0].post_state_facts, [
+            PostStateFact("ctx->ready", "==", "1"),
+        ])
 
     def test_generates_default_candidate_when_switch_has_default(self):
         func = FunctionIR(
@@ -170,6 +197,15 @@ class IrSwitchShapingTests(unittest.TestCase):
                 ("ir_transition_state_1_to_2", ["ctx->state = 1;"], "transition ctx->state 1 -> 2", True),
             ],
         )
+        self.assertEqual(candidates[1].transition_facts, [
+            StateTransitionFact("ctx->state", "1", "2"),
+        ])
+        self.assertIn({
+            "kind": "transition",
+            "selector": "ctx->state",
+            "from": "1",
+            "to": "2",
+        }, candidates[1].semantic_fact_dicts())
 
     def test_generates_candidates_for_symbolic_case_names(self):
         func = FunctionIR(
@@ -212,6 +248,12 @@ class IrSwitchShapingTests(unittest.TestCase):
                             body=[
                                 IfStmt(
                                     BinaryOp("==", FieldAccess(VarRef("ctx", "Context *"), "ready", "int"), IntLiteral(0)),
+                                    [
+                                        AssignmentStmt(
+                                            FieldAccess(VarRef("ctx", "Context *"), "handled", "int"),
+                                            IntLiteral(1),
+                                        )
+                                    ],
                                     loc=SourceLocation("sample.c", 71, 17),
                                 )
                             ],
@@ -248,6 +290,140 @@ class IrSwitchShapingTests(unittest.TestCase):
                 BranchFact("ctx->ready", "==", "0"),
             ],
         )
+        self.assertEqual(candidates[1].post_state_facts, [
+            PostStateFact("ctx->handled", "==", "1"),
+        ])
+        self.assertEqual(candidates[2].post_state_facts, [])
+
+    def test_later_switch_case_guard_inherits_negated_terminating_guard(self):
+        func = FunctionIR(
+            "run",
+            [
+                SwitchStmt(
+                    FieldAccess(VarRef("ctx", "Context *"), "state", "State"),
+                    [
+                        SwitchCase(
+                            "STATE_OPEN",
+                            body=[
+                                IfStmt(
+                                    BinaryOp("&", VarRef("flags", "unsigned"), VarRef("FLAG_FIN", "unsigned")),
+                                    [ReturnStmt(IntLiteral(0))],
+                                ),
+                                IfStmt(
+                                    BinaryOp(">", VarRef("payload_len", "size_t"), IntLiteral(0)),
+                                    [
+                                        AssignmentStmt(
+                                            FieldAccess(VarRef("ctx", "Context *"), "handled", "int"),
+                                            IntLiteral(1),
+                                        )
+                                    ],
+                                ),
+                            ],
+                        )
+                    ],
+                ),
+            ],
+        )
+
+        candidates = state_switch_candidates_from_ir(func, _ops())
+        payload_candidate = next(
+            c for c in candidates
+            if c.target_branch == (
+                "switch ctx->state case STATE_OPEN; "
+                "if !(flags & FLAG_FIN); payload_len > 0"
+            )
+        )
+
+        self.assertEqual(payload_candidate.setup, [
+            "ctx->state = STATE_OPEN;",
+            "flags = 0;",
+            "payload_len = ((0) + 1);",
+        ])
+        self.assertEqual(payload_candidate.branch_facts, [
+            BranchFact("ctx->state", "case", "STATE_OPEN"),
+            BranchFact("flags", "!&", "FLAG_FIN"),
+            BranchFact("payload_len", ">", "0"),
+        ])
+        self.assertEqual(payload_candidate.post_state_facts, [
+            PostStateFact("ctx->handled", "==", "1"),
+        ])
+
+    def test_generates_guarded_transition_candidate_inside_switch_case(self):
+        func = FunctionIR(
+            "run",
+            [
+                SwitchStmt(
+                    FieldAccess(VarRef("ctx", "Context *"), "state", "State"),
+                    [
+                        SwitchCase(
+                            "OPEN",
+                            body=[
+                                IfStmt(
+                                    BinaryOp("==", FieldAccess(VarRef("ctx", "Context *"), "ready", "int"), IntLiteral(1)),
+                                    [
+                                        AssignmentStmt(
+                                            FieldAccess(VarRef("ctx", "Context *"), "state", "State"),
+                                            VarRef("DONE", "State"),
+                                        )
+                                    ],
+                                )
+                            ],
+                        )
+                    ],
+                ),
+            ],
+        )
+
+        candidates = state_switch_candidates_from_ir(func, _ops())
+        transition = next(c for c in candidates if c.name.startswith("ir_transition_state_OPEN_to_DONE"))
+
+        self.assertEqual(transition.setup, ["ctx->state = OPEN;", "ctx->ready = 1;"])
+        self.assertEqual(transition.target_branch, "transition ctx->state OPEN -> DONE when ctx->ready == 1")
+        self.assertEqual(transition.transition_facts, [
+            StateTransitionFact("ctx->state", "OPEN", "DONE", "ctx->ready == 1"),
+        ])
+
+    def test_generates_transition_candidate_across_helper_function(self):
+        caller = FunctionIR(
+            "run",
+            [
+                SwitchStmt(
+                    FieldAccess(VarRef("ctx", "Context *"), "state", "State"),
+                    [
+                        SwitchCase(
+                            "OPEN",
+                            body=[
+                                ExprStmt(CallExpr("finish", [VarRef("ctx", "Context *")]))
+                            ],
+                        )
+                    ],
+                ),
+            ],
+        )
+        helper = FunctionIR(
+            "finish",
+            [
+                AssignmentStmt(
+                    FieldAccess(VarRef("item", "Context *"), "state", "State"),
+                    VarRef("DONE", "State"),
+                ),
+                ReturnStmt(IntLiteral(0)),
+            ],
+        )
+
+        candidates = state_switch_candidates_from_ir(
+            caller,
+            _ops(),
+            {"finish": helper},
+            {"finish": ("item",)},
+        )
+        transition = next(c for c in candidates if c.name.startswith("ir_transition_state_OPEN_to_DONE"))
+
+        self.assertEqual(transition.setup, ["ctx->state = OPEN;"])
+        self.assertEqual(transition.target_branch, "transition ctx->state OPEN -> DONE via helper:finish")
+        self.assertEqual(transition.transition_facts, [
+            StateTransitionFact("ctx->state", "OPEN", "DONE", None, "helper:finish"),
+        ])
 
     def test_resolves_case_guard_aliases(self):
         func = FunctionIR(

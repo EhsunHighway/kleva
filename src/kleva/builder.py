@@ -39,6 +39,7 @@ bounds (preferred over skip_if)
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -47,7 +48,17 @@ from .ktest import KTestObject, find_obj, parse_ktest
 from .recipe import Recipe
 
 MAX_SCALAR_SWEEP_VALUES = 256
-DEFAULT_UNBOUNDED_SCALAR_SWEEP = tuple(range(0, 22))
+MAX_BOUNDARY_SWEEP_VALUES = 6
+DEFAULT_UNBOUNDED_SCALAR_SWEEP = (0, 1, 2)
+MAX_CANDIDATE_RECIPES_PER_SPEC = 1
+
+
+@dataclass(frozen=True)
+class RecipeBuildResult:
+    recipes: list[Recipe]
+    original_count: int
+    deduped_count: int
+    budget_skip_count: int
 
 
 # ── skip condition evaluator ──────────────────────────────────────────────────
@@ -161,9 +172,9 @@ def scalar_sweep_values(spec: FunctionSpec, ktest_objs: list[KTestObject]) -> li
     before EVA so generated unit tests preserve value-level regression
     coverage. The rule is type/name agnostic:
 
-      - bounded scalar inputs with span <= MAX_SCALAR_SWEEP_VALUES are fully
-        enumerated;
-      - a function with one unbounded scalar input gets a small default sweep;
+      - tiny bounded scalar spaces are fully enumerated;
+      - larger bounded scalar spaces use boundary values;
+      - a function with one unbounded scalar input gets a tiny default sweep;
       - larger or multi-scalar spaces are left to KLEE path representatives.
     """
     scalar_inputs = [inp for inp in spec.inputs if not inp.c_type.endswith("[]")]
@@ -177,6 +188,8 @@ def scalar_sweep_values(spec: FunctionSpec, ktest_objs: list[KTestObject]) -> li
         span = hi - lo + 1
         if span <= MAX_SCALAR_SWEEP_VALUES:
             bounded.append((inp, list(range(lo, hi + 1))))
+        else:
+            bounded.append((inp, _boundary_values(lo, hi)))
 
     if len(bounded) == 1:
         inp, values = bounded[0]
@@ -192,6 +205,18 @@ def scalar_sweep_values(spec: FunctionSpec, ktest_objs: list[KTestObject]) -> li
     return []
 
 
+def _boundary_values(lo: int, hi: int) -> list[int]:
+    values = [lo, lo + 1, hi - 1, hi]
+    mid = lo + ((hi - lo) // 2)
+    values.append(mid)
+    out: list[int] = []
+    for value in values:
+        if value < lo or value > hi or value in out:
+            continue
+        out.append(value)
+    return out[:MAX_BOUNDARY_SWEEP_VALUES]
+
+
 # ── collect all recipes for one function ─────────────────────────────────────
 
 def build_recipes_for_function(
@@ -203,21 +228,43 @@ def build_recipes_for_function(
     Parse every .ktest file in spec.ktest_dir and return a Recipe per file.
     Missing ktest dirs are silently treated as zero recipes.
     """
+    return build_recipe_result_for_function(spec, ktest_tool, base_dir).recipes
+
+
+def build_recipe_result_for_function(
+    spec:       FunctionSpec,
+    ktest_tool: str,
+    base_dir:   str = ".",
+) -> RecipeBuildResult:
+    """
+    Parse every .ktest file in spec.ktest_dir and return recipes plus reduction
+    stats.
+
+    Generated implementation candidates can produce several concrete KLEE
+    vectors for the same requested branch/oracle shape. Keep one representative
+    by default so EVA validates the scenario without paying for equivalent
+    scalar-sweep variants. Hand-written or ACSL behavior recipes are not capped.
+    """
     ktest_path = Path(spec.ktest_dir)
     if not ktest_path.is_absolute():
         ktest_path = Path(base_dir) / ktest_path
 
     if not ktest_path.is_dir():
-        return []
+        return RecipeBuildResult([], 0, 0, 0)
 
     recipes: list[Recipe] = []
     seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    original_count = 0
+    deduped_count = 0
 
     def append_unique(recipe: Recipe | None) -> None:
+        nonlocal original_count, deduped_count
         if recipe is None:
             return
+        original_count += 1
         key = (tuple(recipe.decl_lines), tuple(recipe.body_lines))
         if key in seen:
+            deduped_count += 1
             return
         recipe.fn_id = _renumber_fn_id(recipe.fn_id, len(recipes) + 1)
         seen.add(key)
@@ -237,7 +284,53 @@ def build_recipes_for_function(
         else:
             append_unique(build_recipe(spec, objs, len(recipes) + 1, str(kf)))
 
-    return recipes
+    recipes, budget_skip_count = reduce_equivalent_candidate_recipes(recipes)
+    return RecipeBuildResult(recipes, original_count, deduped_count, budget_skip_count)
+
+
+def reduce_equivalent_candidate_recipes(
+    recipes: list[Recipe],
+    *,
+    max_candidate_recipes: int = MAX_CANDIDATE_RECIPES_PER_SPEC,
+) -> tuple[list[Recipe], int]:
+    """
+    Cap equivalent generated candidate recipes after KLEE expansion.
+
+    This is intentionally generic: the key is the requested source/branch/oracle
+    shape, not any project-specific object name. Direct behavior recipes are
+    always preserved.
+    """
+    if max_candidate_recipes <= 0:
+        return recipes, 0
+
+    kept: list[Recipe] = []
+    counts: dict[tuple, int] = {}
+    skipped = 0
+    for recipe in recipes:
+        if not recipe.candidate:
+            kept.append(recipe)
+            continue
+        key = _candidate_recipe_shape_key(recipe)
+        count = counts.get(key, 0)
+        if count >= max_candidate_recipes:
+            skipped += 1
+            continue
+        counts[key] = count + 1
+        recipe.fn_id = _renumber_fn_id(recipe.fn_id, len(kept) + 1)
+        kept.append(recipe)
+    return kept, skipped
+
+
+def _candidate_recipe_shape_key(recipe: Recipe) -> tuple:
+    facts = tuple(sorted(tuple(sorted(fact.items())) for fact in recipe.candidate_facts))
+    return (
+        recipe.candidate_origin,
+        recipe.source_location,
+        recipe.target_branch,
+        tuple(recipe.body_lines),
+        tuple(recipe.outputs),
+        facts,
+    )
 
 
 def _renumber_fn_id(fn_id: str, idx: int) -> str:

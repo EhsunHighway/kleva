@@ -22,7 +22,7 @@ class AssumptionShapingTests(unittest.TestCase):
             ["for (int kleva_i = 0; kleva_i < n; kleva_i++) table->items[kleva_i].valid = 0;"],
         )
 
-    def test_shapes_simple_field_relations_and_valid_read(self):
+    def test_shapes_simple_field_relations_without_buffer_fixture_allocation(self):
         params = {
             "pkt": _param("pkt", "Packet *", "Packet"),
             "iface": _param("iface", "Interface *", "Interface"),
@@ -37,9 +37,9 @@ class AssumptionShapingTests(unittest.TestCase):
 
         self.assertIn("pkt->len = 8;", setup)
         self.assertIn("pkt->data = pkt->head + 20;", setup)
-        self.assertIn("if (pkt->len == 0) pkt->len = 1;", setup)
-        self.assertIn("memset(pkt->data, 0, pkt->len);", setup)
         self.assertIn("iface->up = ((0) + 1);", setup)
+        self.assertNotIn("pkt_read_data", "\n".join(setup))
+        self.assertNotIn("memset(pkt->data, 0, pkt->len);", setup)
 
     def test_shapes_correlation_and_casted_data_field(self):
         params = {
@@ -68,6 +68,41 @@ class AssumptionShapingTests(unittest.TestCase):
         )
 
         self.assertIn("obj->state.used = obj->state.limit;", setup)
+
+    def test_shapes_scalar_to_field_relations(self):
+        params = {
+            "pkt": _param("pkt", "Packet *", "Packet"),
+        }
+
+        setup = assumption_setup_lines(
+            ["header_len <= pkt->len"],
+            params,
+            param_args={"header_len": "1"},
+            shaping_features=set(),
+        )
+
+        self.assertIn("pkt->len = 1;", setup)
+
+    def test_shapes_pointer_distance_relations(self):
+        params = {
+            "p": _param("p", "Packet *", "Packet"),
+        }
+
+        low = assumption_setup_lines(
+            ["(size_t)(p->data - p->head) < header_len"],
+            params,
+            param_args={"header_len": "1"},
+            shaping_features=set(),
+        )
+        high = assumption_setup_lines(
+            ["(size_t)(p->data - p->head) >= header_len"],
+            params,
+            param_args={"header_len": "1"},
+            shaping_features=set(),
+        )
+
+        self.assertIn("p->data = p->head;", low)
+        self.assertIn("p->data = p->head + 1;", high)
 
 
 if __name__ == "__main__":

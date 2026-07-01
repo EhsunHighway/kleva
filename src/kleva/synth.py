@@ -4,9 +4,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from .compat.source_fallbacks import fallback_parse_header
-from .ir.clang_json import parse_header_function_decls
-from .synth_config import SHAPING_FEATURES, load_helper_call_rules
+from .acsl import ScannerAcslParser
+from .kernel import ProgramInput, build_program_model
+from .synth_config import load_helper_call_rules, normalize_shaping_features
 from .synth_generate import generate_yaml_from_header
 
 
@@ -22,6 +22,8 @@ def run_synth(
     shaping: list[str] | None = None,
     no_shaping: list[str] | None = None,
     ir_backend: str = "clang-json",
+    preprocess_ir: bool = False,
+    include_static_functions: bool = False,
     emit_ir: str | None = None,
     ir_diagnostics: str | None = None,
     helper_rules: list[str] | None = None,
@@ -39,23 +41,33 @@ def run_synth(
     inc_dir = include_dir or str(header_path.parent)
     out_path = out or f"kleva/{module_name}.yaml"
 
-    include_roots = [Path(inc_dir), *(Path(p) for p in (extra_includes or []))]
+    acsl_parser = ScannerAcslParser()
     try:
-        funcs = (
-            parse_header_function_decls(header_path, [str(p) for p in include_roots])
-            if ir_backend == "clang-json"
-            else fallback_parse_header(header_path)
+        shaping_features = normalize_shaping_features(shaping, no_shaping)
+    except ValueError as exc:
+        print(f"kleva synth: {exc}", file=sys.stderr)
+        sys.exit(1)
+    program = build_program_model(
+        ProgramInput(
+            header_path=header_path,
+            source_path=src_path,
+            include_dir=inc_dir,
+            extra_includes=tuple(extra_includes or []),
+            extra_sources=tuple(extra_sources or []),
+            ir_backend=ir_backend,
+            preprocess_ir=preprocess_ir,
+            include_static_functions=include_static_functions,
+            acsl_parser=acsl_parser,
+            shaping_features=frozenset(shaping_features),
         )
-    except Exception:
-        funcs = fallback_parse_header(header_path)
+    )
+    funcs = program.functions
+    program.print_fallback_warnings()
     print(f"kleva synth: found {len(funcs)} function(s) in {header_path.name}", file=sys.stderr)
     for f in funcs:
         print(f"  {f.return_type} {f.name}(...)", file=sys.stderr)
 
-    # Parse ACSL
-    from .acsl import ScannerAcslParser
-    acsl_parser = ScannerAcslParser()
-    acsl_specs = acsl_parser.parse_file(header_path)
+    acsl_specs = program.acsl_specs
     acsl_count = sum(1 for s in acsl_specs.values() if s.behaviors)
     if acsl_count:
         print(f"kleva synth: found ACSL contracts for {acsl_count}/{len(funcs)} function(s)", file=sys.stderr)
@@ -70,10 +82,13 @@ def run_synth(
         shaping=shaping,
         no_shaping=no_shaping,
         ir_backend=ir_backend,
+        preprocess_ir=preprocess_ir,
+        include_static_functions=include_static_functions,
         emit_ir_path=emit_ir,
         ir_diagnostics_path=ir_diagnostics,
         helper_call_rules=load_helper_call_rules(helper_rules),
         acsl_parser=acsl_parser,
+        program_model=program,
     )
 
     out_file = Path(out_path)

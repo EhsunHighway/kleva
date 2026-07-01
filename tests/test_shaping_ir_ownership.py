@@ -104,6 +104,28 @@ class IrOwnershipShapingTests(unittest.TestCase):
 
         self.assertEqual(transferred_params_from_ir(func, {"item"}), {"item"})
 
+    def test_detects_parameter_stored_into_struct_array_field(self):
+        func = FunctionIR(
+            "store",
+            [
+                AssignmentStmt(
+                    FieldAccess(
+                        ArraySubscript(
+                            FieldAccess(VarRef("owner"), "items"),
+                            IntLiteral(0),
+                        ),
+                        "payload",
+                    ),
+                    VarRef("item"),
+                )
+            ],
+        )
+
+        self.assertEqual(transferred_params_from_ir(func, {"item"}), {"item"})
+        self.assertEqual(ownership_facts_from_ir(func, {"item"}), [
+            OwnershipFact("item", TRANSFERRED, "owner->items[]->payload"),
+        ])
+
     def test_classifies_pointer_parameter_behavior(self):
         func = FunctionIR(
             "update",
@@ -152,6 +174,21 @@ class IrOwnershipShapingTests(unittest.TestCase):
             OwnershipFact("queued", TRANSFERRED, "items[]"),
             OwnershipFact("done", CONSUMED, "free"),
         ])
+
+    def test_propagates_helper_transfer_to_caller_parameter(self):
+        caller = FunctionIR(
+            "schedule",
+            [ReturnStmt(CallExpr("queue_push", [FieldAccess(VarRef("s"), "queue"), VarRef("event")]))],
+        )
+
+        summary = classify_ownership_from_ir(
+            caller,
+            {"s", "event"},
+            helper_ownership={"queue_push": {1: TRANSFERRED}},
+        )
+
+        self.assertEqual(summary.param_behavior["event"], TRANSFERRED)
+        self.assertEqual(summary.param_behavior["s"], BORROWED)
 
     def test_detects_returned_owned_pointer_from_allocation_call(self):
         func = FunctionIR(

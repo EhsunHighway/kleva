@@ -28,7 +28,7 @@ def loop_table_candidates(
     shaping_features: set[str],
     ops: TableShapeOps,
 ) -> list[BranchCandidate]:
-    if not type_catalog or "loop-tables" not in shaping_features:
+    if not type_catalog or "loop-tables" not in shaping_features or "regex-fallbacks" not in shaping_features:
         return []
 
     candidates: list[BranchCandidate] = []

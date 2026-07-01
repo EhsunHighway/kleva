@@ -48,7 +48,7 @@ class TableShapingTests(unittest.TestCase):
             direct_aliases={},
             derived_aliases={},
             type_catalog=catalog,
-            shaping_features={"loop-tables", "function-pointers"},
+            shaping_features={"loop-tables", "function-pointers", "regex-fallbacks"},
             ops=TableShapeOps(
                 good_path_setup_from_source=lambda *_args: ["base_ok = 1;"],
                 host_to_network_fn=lambda name: name.replace("ntoh", "hton", 1),
@@ -119,7 +119,7 @@ class TableShapingTests(unittest.TestCase):
             direct_aliases={},
             derived_aliases={},
             type_catalog=catalog,
-            shaping_features={"loop-tables"},
+            shaping_features={"loop-tables", "regex-fallbacks"},
             ops=TableShapeOps(
                 good_path_setup_from_source=lambda *_args: [],
                 host_to_network_fn=lambda name: name.replace("ntoh", "hton", 1),

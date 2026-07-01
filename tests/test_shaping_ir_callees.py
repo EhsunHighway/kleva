@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from kleva.ir.model import AddressOf, AssignmentStmt, BinaryOp, CallExpr, DeclarationStmt, Dereference, FieldAccess, FunctionIR, IfStmt, IntLiteral, LoopStmt, ReturnStmt, SourceLocation, SwitchCase, SwitchStmt, UnaryOp, VarRef
-from kleva.shaping.candidates import CallOutcomeFact, PostStateFact
+from kleva.ir.model import AddressOf, ArraySubscript, AssignmentStmt, BinaryOp, CallExpr, CastExpr, DeclarationStmt, Dereference, ExprStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, LoopStmt, ReturnStmt, SourceLocation, SwitchCase, SwitchStmt, UnaryOp, UnknownExpr, VarRef
+from kleva.shaping.candidates import CallOutcomeFact, HelperSideEffectFact, ObjectPathFact, OwnershipPathFact, PostStateFact
 from kleva.shaping.ir_callees import callee_candidates_from_ir, callee_guards_from_ir
 
 
@@ -108,6 +108,49 @@ class IrCalleeShapingTests(unittest.TestCase):
         self.assertEqual(guards[0].failure_when, "zero")
         self.assertEqual(guards[0].loc, SourceLocation("sample.c", 22, 9))
 
+    def test_detects_malloc_guard_even_when_sizeof_argument_is_unrendered(self):
+        func = FunctionIR(
+            "make",
+            [
+                DeclarationStmt("item", init=CallExpr("malloc", [UnknownExpr("sizeof")])),
+                IfStmt(
+                    UnaryOp("!", VarRef("item")),
+                    [ReturnStmt(IntLiteral(0))],
+                    SourceLocation("sample.c", 4, 5),
+                ),
+            ],
+        )
+
+        guards = callee_guards_from_ir(func)
+
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0].callee, "malloc")
+        self.assertEqual(guards[0].args, [])
+        self.assertEqual(guards[0].failure_when, "zero")
+        self.assertEqual(guards[0].result, "item")
+        self.assertEqual(guards[0].allocation_index, 0)
+
+    def test_detects_malloc_guard_for_assigned_field(self):
+        func = FunctionIR(
+            "make",
+            [
+                DeclarationStmt("item", init=CallExpr("malloc", [])),
+                IfStmt(UnaryOp("!", VarRef("item")), [ReturnStmt(IntLiteral(0))]),
+                AssignmentStmt(FieldAccess(VarRef("item"), "buf"), CallExpr("malloc", [VarRef("size")])),
+                IfStmt(
+                    UnaryOp("!", FieldAccess(VarRef("item"), "buf")),
+                    [ReturnStmt(IntLiteral(0))],
+                ),
+            ],
+        )
+
+        guards = callee_guards_from_ir(func)
+
+        self.assertEqual(
+            [(guard.callee, guard.result, guard.allocation_index) for guard in guards],
+            [("malloc", "item", 0), ("malloc", "item->buf", 1)],
+        )
+
     def test_detects_return_value_guard_from_local_assignment(self):
         func = FunctionIR(
             "run",
@@ -152,14 +195,8 @@ class IrCalleeShapingTests(unittest.TestCase):
         self.assertEqual(candidates[1].preamble, ["/* prepare preamble */"])
         self.assertFalse(candidates[0].witness_outputs)
         self.assertTrue(candidates[1].witness_outputs)
-        self.assertEqual(
-            candidates[1].witness_setup,
-            ["int out_ir_callee_prepare_nonzero_success_ctx_ready_nonzero = (ctx->ready != 0);"],
-        )
-        self.assertEqual(
-            candidates[1].extra_outputs,
-            ["out_ir_callee_prepare_nonzero_success_ctx_ready_nonzero"],
-        )
+        self.assertEqual(candidates[1].witness_setup, [])
+        self.assertEqual(candidates[1].extra_outputs, [])
         self.assertEqual(candidates[0].source_location, "sample.c:9:5")
         self.assertEqual(candidates[0].target_branch, "callee prepare failure nonzero")
         self.assertEqual(candidates[0].call_facts, [
@@ -168,9 +205,160 @@ class IrCalleeShapingTests(unittest.TestCase):
         self.assertEqual(candidates[1].call_facts, [
             CallOutcomeFact("prepare", "nonzero", "success"),
         ])
-        self.assertEqual(candidates[1].post_state_facts, [
-            PostStateFact("ctx->ready", "!=", "0"),
+        self.assertEqual(candidates[1].post_state_facts, [])
+
+    def test_callee_guard_resolves_local_alias_arguments(self):
+        func = FunctionIR(
+            "receive",
+            [
+                DeclarationStmt(
+                    "hdr",
+                    init=CastExpr("Header *", FieldAccess(VarRef("pkt", "Packet *"), "data", "uint8_t *")),
+                ),
+                IfStmt(
+                    BinaryOp("!=", CallExpr("checksum", [VarRef("hdr", "Header *")]), IntLiteral(0)),
+                    [ReturnStmt(IntLiteral(-1))],
+                ),
+            ],
+        )
+        helper = FunctionIR(
+            "checksum",
+            [
+                IfStmt(
+                    UnaryOp("!", VarRef("hdr", "Header *")),
+                    [ReturnStmt(IntLiteral(1))],
+                ),
+                ReturnStmt(IntLiteral(0)),
+            ],
+        )
+
+        candidates = callee_candidates_from_ir(
+            func,
+            helper_irs={"checksum": helper},
+            helper_params={"checksum": ("hdr",)},
+        )
+
+        self.assertEqual(candidates[0].name, "ir_callee_checksum_nonzero_failure")
+        self.assertEqual(candidates[0].setup, ["pkt->data = 0;"])
+        self.assertNotIn("hdr = 0;", candidates[0].setup)
+
+    def test_helper_success_non_null_pointer_field_uses_object_path_fact(self):
+        func = FunctionIR(
+            "receive",
+            [
+                IfStmt(
+                    BinaryOp("!=", CallExpr("checksum", [VarRef("frame")]), IntLiteral(0)),
+                    [ReturnStmt(IntLiteral(-1))],
+                )
+            ],
+        )
+        helper = FunctionIR(
+            "checksum",
+            [
+                IfStmt(
+                    UnaryOp("!", FieldAccess(VarRef("pkt", "Packet *"), "data", "uint8_t *")),
+                    [ReturnStmt(IntLiteral(-1))],
+                ),
+                ReturnStmt(IntLiteral(0)),
+            ],
+        )
+
+        candidates = callee_candidates_from_ir(
+            func,
+            helper_irs={"checksum": helper},
+            helper_params={"checksum": ("pkt",)},
+        )
+
+        self.assertEqual(candidates[1].setup, [
+            "/* kleva: non-null pointer path frame->data backed by fixture */",
         ])
+        self.assertIn(ObjectPathFact("frame", ("data",)), candidates[1].object_paths)
+
+    def test_malloc_failure_candidate_uses_allocator_control(self):
+        func = FunctionIR(
+            "make",
+            [
+                DeclarationStmt("item", init=CallExpr("malloc", [])),
+                IfStmt(
+                    UnaryOp("!", VarRef("item")),
+                    [ReturnStmt(IntLiteral(0))],
+                ),
+            ],
+        )
+
+        candidates = callee_candidates_from_ir(func)
+
+        self.assertEqual(candidates[0].name, "ir_alloc_malloc_0_zero_failure")
+        self.assertIn("__kleva_alloc_fail_on(0);", candidates[0].setup)
+        self.assertTrue(any("void *__kleva_malloc(size_t size)" in line for line in candidates[0].preamble))
+        self.assertFalse(any("void *malloc(size_t size)" in line for line in candidates[0].preamble))
+
+    def test_allocating_helper_failure_accounts_for_prior_allocations(self):
+        func = FunctionIR(
+            "make",
+            [
+                DeclarationStmt("owner", init=CallExpr("malloc", [])),
+                DeclarationStmt("queue", init=CallExpr("make_queue", [IntLiteral(1)])),
+                IfStmt(
+                    UnaryOp("!", VarRef("queue")),
+                    [ReturnStmt(IntLiteral(0))],
+                ),
+            ],
+        )
+        helper = FunctionIR(
+            "make_queue",
+            [
+                DeclarationStmt("queue", init=CallExpr("malloc", [])),
+                IfStmt(UnaryOp("!", VarRef("queue")), [ReturnStmt(IntLiteral(0))]),
+                ReturnStmt(VarRef("queue")),
+            ],
+        )
+
+        candidates = callee_candidates_from_ir(func, helper_irs={"make_queue": helper})
+
+        self.assertEqual(candidates[0].name, "ir_callee_make_queue_zero_failure")
+        self.assertIn("__kleva_alloc_fail_on(1);", candidates[0].setup)
+        self.assertTrue(any("void *__kleva_malloc(size_t size)" in line for line in candidates[0].preamble))
+
+    def test_helper_success_setup_treats_casted_null_return_as_zero_failure(self):
+        func = FunctionIR(
+            "run",
+            [
+                DeclarationStmt("item", init=CallExpr("pop", [VarRef("queue")])),
+                IfStmt(UnaryOp("!", VarRef("item")), [ReturnStmt(IntLiteral(0))]),
+            ],
+        )
+        helper = FunctionIR(
+            "pop",
+            [
+                IfStmt(
+                    BinaryOp("==", FieldAccess(VarRef("q"), "count"), IntLiteral(0)),
+                    [ReturnStmt(CastExpr("void *", IntLiteral(0), kind="NullToPointer"))],
+                ),
+                DeclarationStmt(
+                    "item",
+                    c_type="Item *",
+                    init=ArraySubscript(FieldAccess(VarRef("q"), "items", c_type="Item **"), IntLiteral(0), c_type="Item *"),
+                ),
+                ReturnStmt(VarRef("item")),
+            ],
+        )
+
+        candidates = callee_candidates_from_ir(
+            func,
+            helper_irs={"pop": helper},
+            helper_params={"pop": ("q",)},
+        )
+
+        self.assertIn("#include <stdlib.h>", candidates[1].preamble)
+        self.assertIn("queue->count = 1;", candidates[1].setup)
+        self.assertIn("Item * kleva_pop_item_0_array[1];", candidates[1].setup)
+        self.assertIn("memset(kleva_pop_item_0_array, 0, sizeof(kleva_pop_item_0_array));", candidates[1].setup)
+        self.assertIn("queue->items = kleva_pop_item_0_array;", candidates[1].setup)
+        self.assertIn("Item *kleva_pop_item_0 = malloc(sizeof(*kleva_pop_item_0));", candidates[1].setup)
+        self.assertIn("assert(kleva_pop_item_0 != NULL);", candidates[1].setup)
+        self.assertIn("memset(kleva_pop_item_0, 0, sizeof(*kleva_pop_item_0));", candidates[1].setup)
+        self.assertIn("queue->items[0] = kleva_pop_item_0;", candidates[1].setup)
 
     def test_success_candidate_inverts_helper_ir_failure_preconditions(self):
         func = FunctionIR(
@@ -199,13 +387,65 @@ class IrCalleeShapingTests(unittest.TestCase):
             helper_params={"prepare": ("item",)},
         )
 
+        self.assertEqual(candidates[0].setup, ["ctx->ready = 0;"])
         self.assertEqual(candidates[1].setup, ["ctx->ready = 1;"])
-        self.assertIn(
+        self.assertNotIn(
             PostStateFact("ctx->ready", "!=", "0"),
             candidates[1].post_state_facts,
         )
+        self.assertNotIn(
+            ObjectPathFact("ctx", ("ready",)),
+            candidates[1].object_paths,
+        )
 
-    def test_success_candidate_records_post_state_facts_without_domain_names(self):
+    def test_success_candidate_propagates_helper_ownership_facts(self):
+        func = FunctionIR(
+            "run",
+            [
+                IfStmt(
+                    BinaryOp("==", CallExpr("attach", [VarRef("owner"), VarRef("item"), VarRef("tmp")]), UnaryOp("-", IntLiteral(1))),
+                    [ReturnStmt(IntLiteral(-1))],
+                )
+            ],
+        )
+        helper = FunctionIR(
+            "attach",
+            [
+                AssignmentStmt(
+                    FieldAccess(VarRef("box"), "slot"),
+                    VarRef("value"),
+                ),
+                ExprStmt(CallExpr("free", [VarRef("scratch")])),
+                ReturnStmt(IntLiteral(0)),
+            ],
+        )
+
+        candidates = callee_candidates_from_ir(
+            func,
+            helper_irs={"attach": helper},
+            helper_params={"attach": ("box", "value", "scratch")},
+        )
+
+        self.assertIn(
+            OwnershipPathFact("item", "transferred", "attach:box->slot"),
+            candidates[1].ownership_facts,
+        )
+        self.assertIn(
+            OwnershipPathFact("tmp", "consumed", "attach:free"),
+            candidates[1].ownership_facts,
+        )
+        self.assertIn(
+            HelperSideEffectFact("field-changed", "owner->slot", "item", "assignment"),
+            candidates[1].side_effect_facts,
+        )
+        self.assertIn({
+            "kind": "ownership",
+            "target": "item",
+            "action": "transferred",
+            "via": "attach:box->slot",
+        }, candidates[1].semantic_fact_dicts())
+
+    def test_success_candidate_does_not_treat_fixture_setup_as_post_state(self):
         func = FunctionIR(
             "run",
             [
@@ -221,15 +461,12 @@ class IrCalleeShapingTests(unittest.TestCase):
             lambda _callee, args: ([f"{args[0]}->available = 1;"], []),
         )
 
-        self.assertEqual(candidates[1].post_state_facts, [
-            PostStateFact("thing->available", "!=", "0"),
-        ])
-        self.assertEqual(candidates[1].semantic_fact_dicts()[-1], {
-            "kind": "post_state",
-            "target": "thing->available",
-            "relation": "!=",
-            "value": "0",
-        })
+        self.assertEqual(candidates[1].setup, ["thing->available = 1;"])
+        self.assertEqual(candidates[1].post_state_facts, [])
+        self.assertFalse(any(
+            fact.get("kind") == "post_state" and fact.get("target") == "thing->available"
+            for fact in candidates[1].semantic_fact_dicts()
+        ))
 
     def test_success_candidate_infers_post_state_from_helper_ir(self):
         func = FunctionIR(

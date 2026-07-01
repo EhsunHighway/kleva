@@ -99,8 +99,8 @@ class IrTableShapingTests(unittest.TestCase):
         self.assertEqual(
             [(candidate.name, candidate.setup) for candidate in candidates],
             [
-                ("ir_table_items_id_hit", ["items[0].id = wanted;"]),
-                ("ir_table_items_id_miss", ["items[0].id = 0;"]),
+                ("ir_table_items_id_hit", ["count = 1;", "items[0].id = wanted;"]),
+                ("ir_table_items_id_miss", ["count = 1;", "items[0].id = 0;"]),
                 ("ir_table_items_id_full", ["count = 1;", "items[0].id = wanted;"]),
                 ("ir_table_items_id_first_free", ["count = 1;", "items[0].id = 0;"]),
                 (
@@ -117,6 +117,89 @@ class IrTableShapingTests(unittest.TestCase):
         self.assertEqual(candidates[1].branch_facts, [
             BranchFact("items[0].id", "!=", "wanted"),
         ])
+
+    def test_does_not_assign_to_macro_loop_bound(self):
+        func = FunctionIR(
+            "lookup",
+            [
+                LoopStmt(
+                    "for",
+                    BinaryOp("<", VarRef("i"), VarRef("MAX_ITEMS")),
+                    [
+                        IfStmt(BinaryOp(
+                            "==",
+                            FieldAccess(ArraySubscript(VarRef("items"), VarRef("i")), "id"),
+                            VarRef("wanted"),
+                        )),
+                    ],
+                    SourceLocation("sample.c", 21, 5),
+                )
+            ],
+        )
+
+        candidates = table_candidates_from_ir(func)
+
+        self.assertEqual(
+            [(candidate.name, candidate.setup) for candidate in candidates],
+            [
+                ("ir_table_items_id_hit", ["items[0].id = wanted;"]),
+                ("ir_table_items_id_miss", ["items[0].id = 0;"]),
+            ],
+        )
+
+    def test_generates_pointer_array_field_candidates_from_ir_type(self):
+        func = FunctionIR(
+            "lookup",
+            [
+                LoopStmt(
+                    "for",
+                    BinaryOp("<", VarRef("i", "int"), VarRef("count", "int")),
+                    [
+                        IfStmt(BinaryOp(
+                            "==",
+                            FieldAccess(
+                                ArraySubscript(VarRef("items", "Item **"), VarRef("i", "int"), "Item *"),
+                                "id",
+                                "int",
+                            ),
+                            VarRef("wanted", "int"),
+                        )),
+                    ],
+                    SourceLocation("sample.c", 31, 5),
+                )
+            ],
+        )
+
+        candidates = table_candidates_from_ir(func)
+
+        self.assertEqual(candidates[0].setup, [
+            "Item *items_id_0 = malloc(sizeof(*items_id_0));",
+            "if (!items_id_0) return 0;",
+            "memset(items_id_0, 0, sizeof(*items_id_0));",
+            "items[0] = items_id_0;",
+            "count = 1;",
+            "items[0]->id = wanted;",
+        ])
+        self.assertEqual(candidates[0].preamble, ["#include <stdlib.h>"])
+        self.assertEqual(candidates[0].branch_facts, [
+            BranchFact("items[0]->id", "==", "wanted"),
+        ])
+        self.assertEqual(
+            candidates[-1].setup,
+            [
+                "Item *items_id_0 = malloc(sizeof(*items_id_0));",
+                "if (!items_id_0) return 0;",
+                "memset(items_id_0, 0, sizeof(*items_id_0));",
+                "items[0] = items_id_0;",
+                "Item *items_id_1 = malloc(sizeof(*items_id_1));",
+                "if (!items_id_1) return 0;",
+                "memset(items_id_1, 0, sizeof(*items_id_1));",
+                "items[1] = items_id_1;",
+                "count = 2;",
+                "items[0]->id = wanted;",
+                "items[1]->id = wanted;",
+            ],
+        )
 
 
 if __name__ == "__main__":

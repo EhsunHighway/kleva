@@ -8,10 +8,25 @@ from unittest.mock import patch
 
 from kleva.shaping.ir_parsers import HelperCallRule
 from kleva.synth_config import load_helper_call_rules
-from kleva.synth_generate import generate_yaml_from_header
+from kleva.synth_generate import branch_seed_score, generate_yaml_from_header
+from kleva.acsl import ACSLBehavior
 
 
 class SynthIrIntegrationTests(unittest.TestCase):
+    def test_branch_seed_prefers_permissive_success_behavior(self):
+        bad = ACSLBehavior(
+            name="bad",
+            assumes=["capacity == 0"],
+            ensures=[r"\result == \null"],
+        )
+        ok = ACSLBehavior(
+            name="ok",
+            assumes=["capacity > 0"],
+            ensures=[r"\result == \null || \valid(\result)"],
+        )
+
+        self.assertGreater(branch_seed_score(ok), branch_seed_score(bad))
+
     def test_no_acsl_null_candidate_uses_ir_null_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -53,6 +68,52 @@ int maybe_use(Item *item) {
         self.assertIn("int out_ret = maybe_use(NULL);", yaml_text)
         self.assertIn("maybe_use_valid", yaml_text)
 
+    def test_destructor_named_function_does_not_emit_post_free_field_witnesses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "box.h"
+            source = root / "box.c"
+
+            header.write_text(
+                """
+typedef struct Box {
+    int value;
+} Box;
+
+void box_free(Box *box);
+""",
+                encoding="utf-8",
+            )
+            source.write_text(
+                """
+#include "box.h"
+
+static void delegated_destroy(void *ptr) {
+    (void)ptr;
+}
+
+void box_free(Box *box) {
+    if (!box) {
+        return;
+    }
+    delegated_destroy((void *)box);
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+            )
+
+        self.assertIn("box_free_valid", yaml_text)
+        self.assertIn("box_free(box);", yaml_text)
+        self.assertIn("int out_call_completed = 1;", yaml_text)
+        self.assertNotIn("out_box_value", yaml_text)
+        self.assertNotIn("box->value", yaml_text)
+
     def test_no_yaml_synthesis_gets_public_functions_from_clang_header_ast(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -88,7 +149,7 @@ int use_item(Item *item) {
                 encoding="utf-8",
             )
 
-            with patch("kleva.synth_generate._fallback_parse_header", side_effect=AssertionError("source header fallback used")):
+            with patch("kleva.kernel.program.fallback_parse_header", side_effect=AssertionError("source header fallback used")):
                 yaml_text = generate_yaml_from_header(
                     str(header),
                     source_path=str(source),
@@ -96,7 +157,278 @@ int use_item(Item *item) {
                 )
 
         self.assertIn("use_item_valid", yaml_text)
-        self.assertIn("int out_ret = use_item(&item);", yaml_text)
+
+    def test_include_static_functions_emits_source_included_internal_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "api.h"
+            source = root / "api.c"
+
+            header.write_text("int api(int value);\n", encoding="utf-8")
+            source.write_text(
+                """
+#include "api.h"
+
+static int local_helper(int value) {
+    if (value == 0) {
+        return -1;
+    }
+    return value;
+}
+
+int api(int value) {
+    return local_helper(value);
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+                include_static_functions=True,
+            )
+
+        self.assertIn("source_included: true", yaml_text)
+        self.assertIn(f"header:      {source.resolve()}", yaml_text)
+        self.assertIn("api_valid", yaml_text)
+        self.assertIn("local_helper_valid", yaml_text)
+
+    def test_valid_char_pointer_contract_gets_string_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "names.h"
+            source = root / "names.c"
+
+            header.write_text(
+                """
+/*@
+    behavior valid:
+        assumes \\valid(name);
+        ensures \\result == 0 || \\result == -1;
+*/
+int open_name(const char *name);
+""",
+                encoding="utf-8",
+            )
+            source.write_text(
+                """
+#include "names.h"
+
+int open_name(const char *name) {
+    if (!name) {
+        return -1;
+    }
+    return name[0] ? 0 : -1;
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+            )
+
+        self.assertIn("open_name_valid", yaml_text)
+        self.assertIn("char name_buf[]", yaml_text)
+        self.assertIn("kleva", yaml_text)
+        self.assertIn("const char * name = name_buf;", yaml_text)
+        self.assertIn("int out_ret = open_name(name);", yaml_text)
+
+    def test_valid_read_byte_pointer_contract_gets_byte_buffer_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "bytes.h"
+            source = root / "bytes.c"
+
+            header.write_text(
+                """
+#include <stdint.h>
+
+/*@
+    behavior valid:
+        assumes \\valid_read(data + (0 .. 7));
+        ensures \\result == 0 || \\result == -1;
+*/
+int parse_bytes(const uint8_t *data);
+""",
+                encoding="utf-8",
+            )
+            source.write_text(
+                """
+#include "bytes.h"
+
+int parse_bytes(const uint8_t *data) {
+    if (!data) {
+        return -1;
+    }
+    return data[0] == 0 ? 0 : -1;
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+            )
+
+        self.assertIn("parse_bytes_valid", yaml_text)
+        self.assertIn("uint8_t data_buf[8];", yaml_text)
+        self.assertIn("const uint8_t * data = data_buf;", yaml_text)
+        self.assertIn("int out_ret = parse_bytes(data);", yaml_text)
+        self.assertIn("parse_bytes_ir_diversity_data_all_zero", yaml_text)
+        self.assertIn("parse_bytes_ir_diversity_data_all_0xff", yaml_text)
+        self.assertIn("parse_bytes_ir_diversity_data_first_byte_set", yaml_text)
+        self.assertIn("memset(data_buf, 0xFF, sizeof(data_buf));", yaml_text)
+        self.assertIn("if (sizeof(data_buf) > 0) data_buf[0] = 1;", yaml_text)
+        self.assertIn('diversity: "byte-buffer"', yaml_text)
+        self.assertIn('value: "first-byte-set"', yaml_text)
+
+    def test_synthesis_emits_curated_scalar_diversity_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "sizes.h"
+            source = root / "sizes.c"
+
+            header.write_text(
+                """
+#include <stddef.h>
+
+/*@
+    behavior valid:
+        ensures \\result == 0 || \\result == -1;
+*/
+int reserve(size_t len);
+""",
+                encoding="utf-8",
+            )
+            source.write_text(
+                """
+#include "sizes.h"
+
+int reserve(size_t len) {
+    return len == 0 ? -1 : 0;
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+            )
+
+        self.assertIn("reserve_ir_diversity_len_zero", yaml_text)
+        self.assertIn("int out_ret = reserve(0);", yaml_text)
+        self.assertIn("reserve_ir_diversity_len_one", yaml_text)
+        self.assertIn("int out_ret = reserve(1);", yaml_text)
+        self.assertIn("reserve_ir_diversity_len_two", yaml_text)
+        self.assertIn("int out_ret = reserve(2);", yaml_text)
+        self.assertIn('diversity: "scalar"', yaml_text)
+
+    def test_valid_writable_byte_pointer_contract_gets_byte_buffer_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "write_bytes.h"
+            source = root / "write_bytes.c"
+
+            header.write_text(
+                """
+#include <stdint.h>
+
+/*@
+    behavior valid:
+        assumes \\valid(data + (0 .. 7));
+        ensures \\result == 0 || \\result == -1;
+*/
+int fill_bytes(uint8_t *data);
+""",
+                encoding="utf-8",
+            )
+            source.write_text(
+                """
+#include "write_bytes.h"
+
+int fill_bytes(uint8_t *data) {
+    if (!data) {
+        return -1;
+    }
+    data[0] = 1;
+    return 0;
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+            )
+
+        self.assertIn("fill_bytes_valid", yaml_text)
+        self.assertIn("uint8_t data_buf[8];", yaml_text)
+        self.assertIn("uint8_t * data = data_buf;", yaml_text)
+        self.assertIn("int out_ret = fill_bytes(data);", yaml_text)
+
+    def test_valid_read_object_path_contract_gets_byte_buffer_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = root / "buffer_obj.h"
+            source = root / "buffer_obj.c"
+
+            header.write_text(
+                """
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct Buffer {
+    size_t len;
+    uint8_t *data;
+} Buffer;
+
+/*@
+    behavior valid:
+        assumes \\valid(buf);
+        assumes buf->len == 8;
+        assumes \\valid_read(buf->data + (0 .. buf->len - 1));
+        ensures \\result == 0 || \\result == -1;
+*/
+int parse_buffer(Buffer *buf);
+""",
+                encoding="utf-8",
+            )
+            source.write_text(
+                """
+#include "buffer_obj.h"
+
+int parse_buffer(Buffer *buf) {
+    if (!buf || !buf->data) {
+        return -1;
+    }
+    return buf->len == 8 ? 0 : -1;
+}
+""",
+                encoding="utf-8",
+            )
+
+            yaml_text = generate_yaml_from_header(
+                str(header),
+                source_path=str(source),
+                include_dir=str(root),
+            )
+
+        self.assertIn("parse_buffer_valid", yaml_text)
+        self.assertIn("uint8_t buf_data_buffer[64];", yaml_text)
+        self.assertIn("if (buf.data == NULL) buf.data = buf_data_buffer;", yaml_text)
+        self.assertIn("memset(buf.data, 0, buf.len);", yaml_text)
+        self.assertIn("int out_ret = parse_buffer(&buf);", yaml_text)
 
     def test_no_yaml_synthesis_does_not_scan_source_bodies_on_default_ir_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -403,10 +735,20 @@ int machine_step(Machine *m) {
             source = root / "machine.c"
             diagnostics_json = root / "ir-diagnostics.json"
 
-            header.write_text("int machine_step(void);\n", encoding="utf-8")
+            header.write_text(
+                """
+/*@
+    behavior valid:
+        assumes \true;
+        ensures \result == 0;
+*/
+int machine_step(void);
+""",
+                encoding="utf-8",
+            )
             source.write_text("int machine_step(void) { return 0; }\n", encoding="utf-8")
 
-            generate_yaml_from_header(
+            yaml_text = generate_yaml_from_header(
                 str(header),
                 source_path=str(source),
                 include_dir=str(root),
@@ -422,6 +764,10 @@ int machine_step(Machine *m) {
         self.assertEqual(data[1]["backend"], "source-fallback")
         self.assertEqual(data[1]["status"], "used")
         self.assertIn("IR backend is off", data[1]["error"])
+        self.assertIn("candidate_facts:", yaml_text)
+        self.assertIn("kind: fallback", yaml_text)
+        self.assertIn('function: "machine_step"', yaml_text)
+        self.assertIn('scope: "function"', yaml_text)
 
     def test_ir_diagnostics_records_extraction_failure_without_stopping_synthesis(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -555,8 +901,8 @@ int run(Worker *w) {
 
         self.assertIn("run_ir_callee_prepare_equals__1_success", yaml_text)
         self.assertIn("w.ready = 1;", yaml_text)
-        self.assertIn("out_ir_callee_prepare_equals__1_success_w_ready_nonzero", yaml_text)
-        self.assertIn("int out_ir_callee_prepare_equals__1_success_w_ready_nonzero = (w.ready != 0);", yaml_text)
+        self.assertNotIn("out_ir_callee_prepare_equals__1_success_w_ready_nonzero", yaml_text)
+        self.assertNotIn("int out_ir_callee_prepare_equals__1_success_w_ready_nonzero = (w.ready != 0);", yaml_text)
 
     def test_no_yaml_synthesis_gets_helper_signatures_from_clang_decls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -600,7 +946,7 @@ int run(Worker *w) {
                 encoding="utf-8",
             )
 
-            with patch("kleva.synth_generate._fallback_function_decl_map", side_effect=AssertionError("source decl fallback used")):
+            with patch("kleva.kernel.program.fallback_function_decl_map", side_effect=AssertionError("source decl fallback used")):
                 yaml_text = generate_yaml_from_header(
                     str(header),
                     source_path=str(source),
@@ -647,7 +993,7 @@ int install(Holder *h) {
                 encoding="utf-8",
             )
 
-            with patch("kleva.synth_generate._fallback_build_type_catalog", side_effect=AssertionError("source type fallback used")):
+            with patch("kleva.kernel.program.fallback_build_type_catalog", side_effect=AssertionError("source type fallback used")):
                 yaml_text = generate_yaml_from_header(
                     str(header),
                     source_path=str(source),
@@ -704,7 +1050,7 @@ int run(int limit) {
 
         self.assertIn("run_ir_callee_check_size_equals__1_success", yaml_text)
         self.assertIn("limit = 1;", yaml_text)
-        self.assertIn("int out_ir_callee_check_size_equals__1_success_limit_nonzero = (limit != 0);", yaml_text)
+        self.assertNotIn("int out_ir_callee_check_size_equals__1_success_limit_nonzero = (limit != 0);", yaml_text)
 
     def test_no_yaml_synthesis_uses_ir_parser_boundary_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:

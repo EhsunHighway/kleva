@@ -276,6 +276,31 @@ branches:
     covered: true
 ```
 
+## Generated Test Quality Report
+
+KLEVA can summarize generated unit-test artifacts without running coverage:
+
+```sh
+kleva quality-report unit --out kleva-quality-report.md
+```
+
+The input can be one generated test file or a directory containing files named
+`test_*_kleva.c`. The report includes trusted test count, trusted assertion
+count, EVA-proven assertion count, unproved diagnostic count, skipped candidate
+count when pipeline metadata is available, and runtime when pipeline metadata
+is available.
+
+Each `kleva gen`, `kleva all`, or `kleva run --mode gen|all` run writes a
+small sibling summary file next to the generated unit test:
+
+```text
+unit/test_<module>_kleva_summary.json
+```
+
+Older generated tests still appear in the quality report, but skipped
+candidate and runtime columns are shown as `n/a` until that module is
+regenerated with the summary-producing pipeline.
+
 ## Output Files
 
 By default, generated artifacts use paths from the synthesized plan:
@@ -284,5 +309,6 @@ By default, generated artifacts use paths from the synthesized plan:
 - KLEE outputs: `klee_build/klee_out_*`
 - EVA probe: `eva/eva_<module>_kleva.c`
 - Unit test: `unit/test_<module>_kleva.c`
+- Pipeline summary: `unit/test_<module>_kleva_summary.json`
 
 `--base-dir` controls where those relative paths are resolved.

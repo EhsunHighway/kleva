@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from .model import FunctionIR, IfStmt, LoopStmt, ReturnStmt, Stmt, SwitchStmt
+from .model import BreakStmt, ContinueStmt, FunctionIR, IfStmt, LoopStmt, ReturnStmt, Stmt, SwitchStmt
 
 
 def walk_statements(func: FunctionIR) -> Iterator[Stmt]:
@@ -18,6 +18,10 @@ def walk_if_statements(func: FunctionIR) -> Iterator[IfStmt]:
 
 def body_has_return(statements: list[Stmt]) -> bool:
     return any(isinstance(stmt, ReturnStmt) for stmt in statements)
+
+
+def body_has_terminator(statements: list[Stmt]) -> bool:
+    return any(isinstance(stmt, (BreakStmt, ContinueStmt, ReturnStmt)) for stmt in statements)
 
 
 def walk_statement(stmt: Stmt) -> Iterator[Stmt]:

@@ -12,6 +12,13 @@ from kleva.fixtures.construction import (
     pointer_argument_setup,
     unique_name,
 )
+from kleva.fixtures.requirements import (
+    FixtureRequirementKind,
+    byte_buffer,
+    fixture_failure_comments,
+    requirements_from_assumptions,
+    string_buffer,
+)
 
 
 def _param(name, raw_type, base_type, is_pointer=False, is_array=False, array_size=0):
@@ -55,7 +62,17 @@ class FixtureConstructionTests(unittest.TestCase):
 
         setup, arg, cleanup = pointer_argument_setup(_param("bytes", "uint8_t *", "uint8_t", True))
         self.assertIn("uint8_t bytes_buf[64];", setup)
-        self.assertEqual(arg, "bytes_buf")
+        self.assertIn("uint8_t * bytes = bytes_buf;", setup)
+        self.assertEqual(arg, "bytes")
+        self.assertEqual(cleanup, [])
+
+        setup, arg, cleanup = pointer_argument_setup(
+            _param("mac", "const uint8_t * mac", "uint8_t", True),
+            preferred_name="iface_mac",
+        )
+        self.assertIn("uint8_t iface_mac_buf[64];", setup)
+        self.assertIn("const uint8_t * iface_mac = iface_mac_buf;", setup)
+        self.assertEqual(arg, "iface_mac")
         self.assertEqual(cleanup, [])
 
         setup, arg, cleanup = pointer_argument_setup(
@@ -70,6 +87,140 @@ class FixtureConstructionTests(unittest.TestCase):
         self.assertIn("widget.stores = &widget_stores_slot;", setup)
         self.assertEqual(arg, "&widget")
         self.assertEqual(cleanup, [])
+
+    def test_pointer_argument_setup_preserves_shared_used_name_set(self):
+        catalog = CTypeCatalog(complete_structs={"Scheduler"}, struct_fields={"Scheduler": {}})
+        used: set[str] = set()
+
+        setup_a, arg_a, _ = pointer_argument_setup(
+            _param("sched", "Scheduler *sched", "Scheduler", True),
+            type_catalog=catalog,
+            preferred_name="sim_sched",
+            used_names=used,
+        )
+        setup_b, arg_b, _ = pointer_argument_setup(
+            _param("sched", "Scheduler *sched", "Scheduler", True),
+            type_catalog=catalog,
+            preferred_name="sim_sched",
+            used_names=used,
+        )
+
+        self.assertIn("Scheduler sim_sched;", setup_a)
+        self.assertIn("Scheduler sim_sched_2;", setup_b)
+        self.assertEqual(arg_a, "&sim_sched")
+        self.assertEqual(arg_b, "&sim_sched_2")
+
+    def test_pointer_argument_setup_uses_string_buffer_requirement_for_char_pointer(self):
+        setup, arg, cleanup = pointer_argument_setup(
+            _param("name", "const char *name", "char", True),
+            requirements=[string_buffer("name")],
+        )
+
+        self.assertIn('char name_buf[] = "kleva";', setup)
+        self.assertIn("const char *name = name_buf;", setup)
+        self.assertEqual(arg, "name")
+        self.assertEqual(cleanup, [])
+
+    def test_pointer_argument_setup_uses_byte_buffer_requirement_size(self):
+        setup, arg, cleanup = pointer_argument_setup(
+            _param("data", "uint8_t *data", "uint8_t", True),
+            requirements=[byte_buffer("data", "8")],
+        )
+
+        self.assertIn("uint8_t data_buf[8];", setup)
+        self.assertIn("uint8_t *data = data_buf;", setup)
+        self.assertEqual(arg, "data")
+        self.assertEqual(cleanup, [])
+
+    def test_pointer_argument_setup_uses_byte_buffer_content_requirement(self):
+        setup, arg, cleanup = pointer_argument_setup(
+            _param("data", "uint8_t *data", "uint8_t", True),
+            requirements=[byte_buffer("data", "8", content="first-byte-set")],
+        )
+
+        self.assertIn("uint8_t data_buf[8];", setup)
+        self.assertIn("memset(data_buf, 0, sizeof(data_buf));", setup)
+        self.assertIn("if (sizeof(data_buf) > 0) data_buf[0] = 1;", setup)
+        self.assertIn("uint8_t *data = data_buf;", setup)
+        self.assertEqual(arg, "data")
+        self.assertEqual(cleanup, [])
+
+    def test_pointer_argument_setup_uses_safe_size_for_symbolic_byte_buffer_requirement(self):
+        setup, arg, _cleanup = pointer_argument_setup(
+            _param("data", "uint8_t *data", "uint8_t", True),
+            requirements=[byte_buffer("data", "len")],
+        )
+
+        self.assertIn("uint8_t data_buf[64];", setup)
+        self.assertEqual(arg, "data")
+
+    def test_requirements_from_assumptions_extracts_valid_read_byte_buffer(self):
+        requirements = requirements_from_assumptions(
+            [r"\valid_read(data + (0 .. 7))"]
+        )
+
+        self.assertEqual(len(requirements), 1)
+        self.assertEqual(requirements[0].kind, FixtureRequirementKind.BYTE_BUFFER)
+        self.assertEqual(requirements[0].target, "data")
+        self.assertEqual(requirements[0].size, "8")
+        self.assertEqual(requirements[0].access, "read")
+
+    def test_requirements_from_assumptions_extracts_valid_writable_byte_buffer(self):
+        requirements = requirements_from_assumptions(
+            [r"\valid(data + (0 .. 7))"]
+        )
+
+        self.assertEqual(len(requirements), 1)
+        self.assertEqual(requirements[0].kind, FixtureRequirementKind.BYTE_BUFFER)
+        self.assertEqual(requirements[0].target, "data")
+        self.assertEqual(requirements[0].size, "8")
+        self.assertEqual(requirements[0].access, "write")
+
+    def test_requirements_from_assumptions_extracts_object_path_byte_buffer(self):
+        requirements = requirements_from_assumptions(
+            [r"\valid_read(buf->data + (0 .. buf->len - 1))"]
+        )
+
+        self.assertEqual(len(requirements), 1)
+        self.assertEqual(requirements[0].kind, FixtureRequirementKind.OBJECT_PATH_BYTE_BUFFER)
+        self.assertEqual(requirements[0].target, "buf->data")
+        self.assertEqual(requirements[0].size, "buf->len")
+        self.assertEqual(requirements[0].access, "read")
+
+    def test_requirements_from_assumptions_extracts_object_path_values(self):
+        requirements = requirements_from_assumptions(
+            [
+                r"ctx->state == 1",
+                r"ctx->conn->state >= READY",
+                r"table->items[0].value < 4",
+            ]
+        )
+
+        values = [req for req in requirements if req.kind == FixtureRequirementKind.OBJECT_PATH_VALUE]
+        self.assertEqual([(req.target, req.relation, req.value) for req in values], [
+            ("ctx->state", "==", "1"),
+            ("ctx->conn->state", ">=", "READY"),
+            ("table->items[0].value", "<", "4"),
+        ])
+
+    def test_fixture_failure_comments_report_conflicting_constraints(self):
+        requirements = requirements_from_assumptions(
+            [
+                r"\valid(ctx)",
+                r"ctx == \null",
+                r"ctx->state == 1",
+                r"ctx->state == 2",
+            ]
+        )
+
+        self.assertIn(
+            "/* fixture-failed: conflicting constraints: ctx is both null and valid */",
+            fixture_failure_comments(requirements),
+        )
+        self.assertIn(
+            "/* fixture-failed: conflicting constraints: ctx->state == 1 and ctx->state == 2 */",
+            fixture_failure_comments(requirements),
+        )
 
     def test_complete_struct_setup_shapes_struct_and_pointer_arrays(self):
         catalog = CTypeCatalog(

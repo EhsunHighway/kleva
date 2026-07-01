@@ -28,7 +28,8 @@ def assignable_expr(expr: Expr) -> str | None:
         base = assignable_expr(expr.base) or value_expr(expr.base)
         if base is None:
             return None
-        return f"{base}{_field_operator(expr.base)}{expr.field}"
+        op = _field_operator(expr.base)
+        return f"{_field_base_expr(base, op)}{op}{expr.field}"
     if isinstance(expr, ArraySubscript):
         base = assignable_expr(expr.base) or value_expr(expr.base)
         index = value_expr(expr.index)
@@ -87,3 +88,9 @@ def _field_operator(base: Expr) -> str:
     if isinstance(base, CastExpr) and base.target_type:
         return "->" if "*" in base.target_type else "."
     return "->"
+
+
+def _field_base_expr(base: str, op: str) -> str:
+    if op == "->" and base.startswith("&"):
+        return f"({base})"
+    return base

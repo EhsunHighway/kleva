@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from ..ir.aliases import record_alias, resolve_aliases
 from ..ir.model import (
     AssignmentStmt,
+    BreakStmt,
     DeclarationStmt,
     Expr,
     FieldAccess,
@@ -12,18 +14,33 @@ from ..ir.model import (
     IfStmt,
     IntLiteral,
     LoopStmt,
+    ExprStmt,
     CallExpr,
     AddressOf,
     ArraySubscript,
     Stmt,
     SwitchStmt,
+    ContinueStmt,
     ReturnStmt,
     VarRef,
 )
 from ..ir.naming import safe_name
 from ..ir.render import assignable_expr
-from .candidates import BranchCandidate, BranchFact, ObjectPathFact, display_source_location, object_path_facts_from_expr
-from .ir_conditions import IrConditionOps, condition_setup_alternatives
+from .candidates import BranchCandidate, BranchFact, ObjectPathFact, StateTransitionFact, display_source_location, object_path_facts_from_expr
+from .ir_conditions import IrConditionOps, condition_setup_alternatives, path_precondition_alternatives
+from .ir_helper_effects import helper_effect_summary
+from .ir_poststate import post_state_facts_from_direct_assignments
+
+
+@dataclass(frozen=True)
+class StateTransition:
+    selector:    str
+    source:      int | str
+    target:      int | str
+    setup:       tuple[str, ...] = ()
+    guard:       str | None = None
+    via:         str | None = None
+    loc_display: str | None = None
 
 
 def state_switch_candidates_from_ir(
@@ -55,6 +72,7 @@ def state_switch_candidates_from_ir(
             continue
         object_paths = object_path_facts_from_expr(selector)
         for case in stmt.cases:
+            case_post_state_facts = post_state_facts_from_direct_assignments(case.body)
             case_name = safe_name(str(case.value), "switch")
             name = f"ir_case_{safe_name(selector_leaf, 'switch')}_{case_name}"
             case_setup = [f"{selector_text} = {case.value};"]
@@ -70,6 +88,7 @@ def state_switch_candidates_from_ir(
                 origin="ir",
                 object_paths=object_paths,
                 branch_facts=[case_fact],
+                post_state_facts=case_post_state_facts,
             ))
             if condition_ops is not None:
                 guard_candidates = _case_guard_candidates(
@@ -92,21 +111,48 @@ def state_switch_candidates_from_ir(
                         continue
                     seen.add(guard_candidate.name)
                     candidates.append(guard_candidate)
-            for value in _assigned_values_to_selector(stmt, selector, aliases):
-                if value == case.value:
+            for transition in _transitions_for_case(
+                func,
+                stmt,
+                selector_text,
+                selector,
+                case.value,
+                case.body,
+                aliases,
+                lookup_aliases,
+                condition_ops,
+                helper_irs or {},
+                helper_params or {},
+            ):
+                if transition.target == case.value:
                     continue
-                transition_name = f"ir_transition_{safe_name(selector_leaf, 'switch')}_{case_name}_to_{safe_name(str(value), 'switch')}"
+                transition_name = (
+                    f"ir_transition_{safe_name(selector_leaf, 'switch')}_"
+                    f"{case_name}_to_{safe_name(str(transition.target), 'switch')}"
+                )
+                if transition.guard:
+                    transition_name = f"{transition_name}_{safe_name(transition.guard, 'guard')}"
+                if transition.via:
+                    transition_name = f"{transition_name}_{safe_name(transition.via, 'via')}"
                 if transition_name in seen:
                     continue
                 seen.add(transition_name)
                 candidates.append(BranchCandidate(
                     transition_name,
-                    [f"{selector_text} = {case.value};"],
-                    source_location=display_source_location(stmt.loc, f"ir:{func.name}:switch[{index}]"),
-                    target_branch=f"transition {selector_text} {case.value} -> {value}",
+                    [*case_setup, *transition.setup],
+                    source_location=transition.loc_display or display_source_location(stmt.loc, f"ir:{func.name}:switch[{index}]"),
+                    target_branch=_transition_branch_text(transition),
                     origin="ir",
                     object_paths=object_paths,
                     branch_facts=[BranchFact(selector_text, "case", str(case.value))],
+                    transition_facts=[StateTransitionFact(
+                        selector_text,
+                        str(case.value),
+                        str(transition.target),
+                        transition.guard,
+                        transition.via,
+                    )],
+                    post_state_facts=case_post_state_facts,
                     witness_outputs=True,
                 ))
         if stmt.has_default and stmt.cases:
@@ -245,29 +291,39 @@ def _case_guard_candidates(
     candidates: list[BranchCandidate] = []
     case_name = safe_name(str(case_value), "switch")
     guard_index = 0
-    for if_stmt, condition, local_names in _if_conditions_with_aliases(case_body, aliases, set()):
+    for if_stmt, condition, local_names, path_conditions in _if_conditions_with_aliases(case_body, aliases, set(), []):
+        true_post_state_facts = post_state_facts_from_direct_assignments(if_stmt.body)
         guard_index += 1
+        path_preconditions = path_precondition_alternatives(path_conditions, condition_ops)
         for suffix, guard_setup, branch_text, guard_paths, guard_facts in condition_setup_alternatives(condition, condition_ops):
             guard_setup = _rewrite_lookup_lines(guard_setup, lookup_aliases)
             branch_text = _rewrite_lookup_text(branch_text, lookup_aliases) or branch_text
             guard_facts = _rewrite_lookup_branch_facts(guard_facts, lookup_aliases)
             if not guard_setup:
                 continue
-            if _setup_references_local_root(guard_setup, local_names):
-                continue
-            name = _clean_name(f"ir_case_guard_{safe_name(selector_leaf, 'switch')}_{case_name}_{guard_index}_{safe_name(suffix, 'guard')}")
-            candidates.append(BranchCandidate(
-                name,
-                [*case_setup, *guard_setup],
-                source_location=display_source_location(
-                    if_stmt.loc or switch_stmt.loc,
-                    f"ir:{func.name}:switch[{switch_index}]:case[{case_name}]:if[{guard_index}]",
-                ),
-                target_branch=f"switch {selector_text} case {case_value}; if {branch_text}",
-                origin="ir",
-                object_paths=_dedup_object_paths([*object_paths, *guard_paths]),
-                branch_facts=[case_fact, *guard_facts],
-            ))
+            for path_setup, path_branch_text, path_paths, path_facts in path_preconditions:
+                combined_setup = _dedup_setup([*case_setup, *path_setup, *guard_setup])
+                if _setup_references_local_root(combined_setup, local_names):
+                    continue
+                combined_branch_text = (
+                    f"{path_branch_text}; {branch_text}"
+                    if path_branch_text
+                    else branch_text
+                )
+                name = _clean_name(f"ir_case_guard_{safe_name(selector_leaf, 'switch')}_{case_name}_{guard_index}_{safe_name(suffix, 'guard')}")
+                candidates.append(BranchCandidate(
+                    name,
+                    combined_setup,
+                    source_location=display_source_location(
+                        if_stmt.loc or switch_stmt.loc,
+                        f"ir:{func.name}:switch[{switch_index}]:case[{case_name}]:if[{guard_index}]",
+                    ),
+                    target_branch=f"switch {selector_text} case {case_value}; if {combined_branch_text}",
+                    origin="ir",
+                    object_paths=_dedup_object_paths([*object_paths, *path_paths, *guard_paths]),
+                    branch_facts=[case_fact, *path_facts, *guard_facts],
+                    post_state_facts=[] if suffix.startswith("false_") else true_post_state_facts,
+                ))
     return candidates
 
 
@@ -275,25 +331,334 @@ def _if_conditions_with_aliases(
     statements:   list[Stmt],
     aliases:      dict[str, Expr],
     local_names:  set[str],
-) -> list[tuple[IfStmt, Expr, set[str]]]:
-    found: list[tuple[IfStmt, Expr, set[str]]] = []
+    path_conditions: list[Expr],
+) -> list[tuple[IfStmt, Expr, set[str], list[Expr]]]:
+    found: list[tuple[IfStmt, Expr, set[str], list[Expr]]] = []
     current_aliases = dict(aliases)
     current_locals  = set(local_names)
+    current_path_conditions = list(path_conditions)
     for stmt in statements:
         if isinstance(stmt, DeclarationStmt):
             current_locals.add(stmt.name)
         record_alias(stmt, current_aliases)
         if isinstance(stmt, IfStmt):
-            found.append((stmt, resolve_aliases(stmt.condition, current_aliases), set(current_locals)))
-            found.extend(_if_conditions_with_aliases(stmt.body, dict(current_aliases), set(current_locals)))
+            resolved_condition = resolve_aliases(stmt.condition, current_aliases)
+            found.append((stmt, resolved_condition, set(current_locals), list(current_path_conditions)))
+            found.extend(_if_conditions_with_aliases(stmt.body, dict(current_aliases), set(current_locals), list(current_path_conditions)))
+            if _body_exits(stmt.body):
+                current_path_conditions.append(resolved_condition)
         elif isinstance(stmt, LoopStmt):
-            found.extend(_if_conditions_with_aliases(stmt.body, dict(current_aliases), set(current_locals)))
+            found.extend(_if_conditions_with_aliases(stmt.body, dict(current_aliases), set(current_locals), list(current_path_conditions)))
         elif isinstance(stmt, SwitchStmt):
-            found.extend(_if_conditions_with_aliases(stmt.body, dict(current_aliases), set(current_locals)))
+            found.extend(_if_conditions_with_aliases(stmt.body, dict(current_aliases), set(current_locals), list(current_path_conditions)))
             for case in stmt.cases:
-                found.extend(_if_conditions_with_aliases(case.body, dict(current_aliases), set(current_locals)))
-            found.extend(_if_conditions_with_aliases(stmt.default_body, dict(current_aliases), set(current_locals)))
+                found.extend(_if_conditions_with_aliases(case.body, dict(current_aliases), set(current_locals), list(current_path_conditions)))
+            found.extend(_if_conditions_with_aliases(stmt.default_body, dict(current_aliases), set(current_locals), list(current_path_conditions)))
     return found
+
+
+def _body_exits(body: list[Stmt]) -> bool:
+    return any(isinstance(stmt, (BreakStmt, ContinueStmt, ReturnStmt)) for stmt in body)
+
+
+def _dedup_setup(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return out
+
+
+def _transitions_for_case(
+    func:           FunctionIR,
+    switch_stmt:    SwitchStmt,
+    selector_text:  str,
+    selector:       Expr,
+    case_value:     int | str,
+    case_body:      list[Stmt],
+    aliases:        dict[str, Expr],
+    lookup_aliases: dict[str, str],
+    condition_ops:  IrConditionOps | None,
+    helper_irs:     dict[str, FunctionIR],
+    helper_params:  dict[str, tuple[str, ...]],
+) -> list[StateTransition]:
+    transitions: list[StateTransition] = []
+    transitions.extend(_transitions_from_statements(
+        func,
+        switch_stmt.body,
+        selector_text,
+        selector,
+        case_value,
+        aliases,
+        lookup_aliases,
+        condition_ops,
+        helper_irs,
+        helper_params,
+        guard_setup=(),
+        guard_text=None,
+    ))
+    transitions.extend(_transitions_from_statements(
+        func,
+        case_body,
+        selector_text,
+        selector,
+        case_value,
+        aliases,
+        lookup_aliases,
+        condition_ops,
+        helper_irs,
+        helper_params,
+        guard_setup=(),
+        guard_text=None,
+    ))
+    return _dedup_transitions(transitions)
+
+
+def _transitions_from_statements(
+    func:           FunctionIR,
+    statements:     list[Stmt],
+    selector_text:  str,
+    selector:       Expr,
+    source_value:   int | str,
+    aliases:        dict[str, Expr],
+    lookup_aliases: dict[str, str],
+    condition_ops:  IrConditionOps | None,
+    helper_irs:     dict[str, FunctionIR],
+    helper_params:  dict[str, tuple[str, ...]],
+    guard_setup:    tuple[str, ...],
+    guard_text:     str | None,
+) -> list[StateTransition]:
+    transitions: list[StateTransition] = []
+    current_aliases = dict(aliases)
+    for stmt in statements:
+        record_alias(stmt, current_aliases)
+        direct = _transition_from_assignment(
+            stmt,
+            selector_text,
+            source_value,
+            current_aliases,
+            lookup_aliases,
+            guard_setup,
+            guard_text,
+        )
+        if direct is not None:
+            transitions.append(direct)
+            continue
+
+        helper_transition = _transition_from_helper_call(
+            stmt,
+            selector_text,
+            source_value,
+            current_aliases,
+            lookup_aliases,
+            helper_irs,
+            helper_params,
+            guard_setup,
+            guard_text,
+        )
+        if helper_transition is not None:
+            transitions.append(helper_transition)
+            continue
+
+        if isinstance(stmt, IfStmt):
+            if condition_ops is not None:
+                condition = resolve_aliases(stmt.condition, current_aliases)
+                for suffix, setup, branch_text, _guard_paths, _guard_facts in condition_setup_alternatives(condition, condition_ops):
+                    if suffix.startswith("false_"):
+                        continue
+                    setup = tuple(_rewrite_lookup_lines(setup, lookup_aliases))
+                    if not setup:
+                        continue
+                    transitions.extend(_transitions_from_statements(
+                        func,
+                        stmt.body,
+                        selector_text,
+                        selector,
+                        source_value,
+                        current_aliases,
+                        lookup_aliases,
+                        condition_ops,
+                        helper_irs,
+                        helper_params,
+                        guard_setup=(*guard_setup, *setup),
+                        guard_text=_rewrite_lookup_text(branch_text, lookup_aliases) or branch_text,
+                    ))
+            else:
+                transitions.extend(_transitions_from_statements(
+                    func,
+                    stmt.body,
+                    selector_text,
+                    selector,
+                    source_value,
+                    current_aliases,
+                    lookup_aliases,
+                    condition_ops,
+                    helper_irs,
+                    helper_params,
+                    guard_setup=guard_setup,
+                    guard_text=guard_text,
+                ))
+        elif isinstance(stmt, LoopStmt):
+            transitions.extend(_transitions_from_statements(
+                func,
+                stmt.body,
+                selector_text,
+                selector,
+                source_value,
+                current_aliases,
+                lookup_aliases,
+                condition_ops,
+                helper_irs,
+                helper_params,
+                guard_setup=guard_setup,
+                guard_text=guard_text,
+            ))
+        elif isinstance(stmt, SwitchStmt):
+            transitions.extend(_transitions_from_statements(
+                func,
+                stmt.body,
+                selector_text,
+                selector,
+                source_value,
+                current_aliases,
+                lookup_aliases,
+                condition_ops,
+                helper_irs,
+                helper_params,
+                guard_setup=guard_setup,
+                guard_text=guard_text,
+            ))
+            for case in stmt.cases:
+                transitions.extend(_transitions_from_statements(
+                    func,
+                    case.body,
+                    selector_text,
+                    selector,
+                    source_value,
+                    current_aliases,
+                    lookup_aliases,
+                    condition_ops,
+                    helper_irs,
+                    helper_params,
+                    guard_setup=guard_setup,
+                    guard_text=guard_text,
+                ))
+            transitions.extend(_transitions_from_statements(
+                func,
+                stmt.default_body,
+                selector_text,
+                selector,
+                source_value,
+                current_aliases,
+                lookup_aliases,
+                condition_ops,
+                helper_irs,
+                helper_params,
+                guard_setup=guard_setup,
+                guard_text=guard_text,
+            ))
+    return transitions
+
+
+def _transition_from_assignment(
+    stmt:           Stmt,
+    selector_text:  str,
+    source_value:   int | str,
+    aliases:        dict[str, Expr],
+    lookup_aliases: dict[str, str],
+    guard_setup:    tuple[str, ...],
+    guard_text:     str | None,
+) -> StateTransition | None:
+    if not isinstance(stmt, AssignmentStmt):
+        return None
+    target_text = assignable_expr(resolve_aliases(stmt.target, aliases))
+    target_text = _rewrite_lookup_text(target_text, lookup_aliases)
+    if target_text != selector_text:
+        return None
+    value = _literal_value(resolve_aliases(stmt.value, aliases))
+    if value is None:
+        return None
+    return StateTransition(
+        selector_text,
+        source_value,
+        value,
+        setup=guard_setup,
+        guard=guard_text,
+        via=None,
+    )
+
+
+def _transition_from_helper_call(
+    stmt:           Stmt,
+    selector_text:  str,
+    source_value:   int | str,
+    aliases:        dict[str, Expr],
+    lookup_aliases: dict[str, str],
+    helper_irs:     dict[str, FunctionIR],
+    helper_params:  dict[str, tuple[str, ...]],
+    guard_setup:    tuple[str, ...],
+    guard_text:     str | None,
+) -> StateTransition | None:
+    call = _call_expr_from_stmt(stmt)
+    if call is None:
+        return None
+    helper_ir = helper_irs.get(call.callee)
+    params = helper_params.get(call.callee, ())
+    if helper_ir is None or len(params) != len(call.args):
+        return None
+    args = [
+        assignable_expr(resolve_aliases(arg, aliases)) or ""
+        for arg in call.args
+    ]
+    if any(not arg for arg in args):
+        return None
+    summary = helper_effect_summary(helper_ir, params, args, "equals_-1", call.callee)
+    for fact in summary.post_state:
+        target = _rewrite_lookup_text(fact.target, lookup_aliases)
+        if target != selector_text or fact.relation != "==":
+            continue
+        return StateTransition(
+            selector_text,
+            source_value,
+            fact.value,
+            setup=guard_setup,
+            guard=guard_text,
+            via=f"helper:{call.callee}",
+        )
+    return None
+
+
+def _call_expr_from_stmt(stmt: Stmt) -> CallExpr | None:
+    if isinstance(stmt, ExprStmt) and isinstance(stmt.expr, CallExpr):
+        return stmt.expr
+    if isinstance(stmt, AssignmentStmt) and isinstance(stmt.value, CallExpr):
+        return stmt.value
+    if isinstance(stmt, DeclarationStmt) and isinstance(stmt.init, CallExpr):
+        return stmt.init
+    return None
+
+
+def _transition_branch_text(transition: StateTransition) -> str:
+    text = f"transition {transition.selector} {transition.source} -> {transition.target}"
+    if transition.guard:
+        text = f"{text} when {transition.guard}"
+    if transition.via:
+        text = f"{text} via {transition.via}"
+    return text
+
+
+def _dedup_transitions(transitions: list[StateTransition]) -> list[StateTransition]:
+    out: list[StateTransition] = []
+    seen: set[StateTransition] = set()
+    for transition in transitions:
+        if transition in seen:
+            continue
+        seen.add(transition)
+        out.append(transition)
+    return out
 
 
 def _setup_references_local_root(setup: list[str], local_names: set[str]) -> bool:

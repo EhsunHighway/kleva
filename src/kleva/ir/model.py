@@ -138,6 +138,16 @@ class ReturnStmt(Stmt):
 
 
 @dataclass(frozen=True)
+class BreakStmt(Stmt):
+    loc: SourceLocation | None = None
+
+
+@dataclass(frozen=True)
+class ContinueStmt(Stmt):
+    loc: SourceLocation | None = None
+
+
+@dataclass(frozen=True)
 class LoopStmt(Stmt):
     kind:      str
     condition: Expr | None = None

@@ -79,7 +79,12 @@ from .shaping.ir_conditions import (
 from .shaping.ir_byte_order import decoded_field_aliases_from_ir as _ir_decoded_field_aliases
 from .shaping.ir_callbacks import callback_candidates_from_ir as _ir_callback_candidates
 from .shaping.ir_callees import callee_candidates_from_ir as _ir_callee_candidates
-from .shaping.ir_ownership import classify_ownership_from_ir as _ir_classify_ownership
+from .shaping.ir_ownership import (
+    CONSUMED,
+    OwnershipSummary,
+    TRANSFERRED,
+    classify_ownership_from_ir as _ir_classify_ownership,
+)
 from .shaping.ir_parsers import (
     HelperCallRule,
     IrParserOps,
@@ -211,6 +216,12 @@ def _rewrite_setup_with_param_args(setup: list[str], param_args: dict[str, str])
     for line in setup:
         new_line = line
         for name, arg in sorted(param_args.items(), key=lambda item: len(item[0]), reverse=True):
+            if (
+                re.match(rf"\s*{re.escape(name)}\s*=", new_line)
+                and not re.fullmatch(r"[A-Za-z_]\w*", arg)
+            ):
+                new_line = ""
+                break
             if arg.startswith("&") and re.fullmatch(r"&[A-Za-z_]\w*", arg):
                 obj = arg[1:]
                 new_line = re.sub(
@@ -226,6 +237,11 @@ def _rewrite_setup_with_param_args(setup: list[str], param_args: dict[str, str])
                 new_line,
             )
             new_line = re.sub(rf"(?<![&\w]){re.escape(name)}\b(?!\.)", arg, new_line)
+        if not new_line:
+            continue
+        if re.match(r"\s*NULL\s*=", new_line):
+            continue
+        new_line = re.sub(r"\[\s*[ijk]\s*\]", "[0]", new_line)
         rewritten.append(new_line)
     return rewritten
 
@@ -650,20 +666,37 @@ def _host_to_network_fn(decode_fn: str) -> str:
 
 
 def _nonmatching_value(value: str) -> str:
-    if re.fullmatch(r"0|0x0+", value):
-        return "1"
-    return "0"
+    if re.fullmatch(r"0x[0-9a-fA-F]+|\d+", value):
+        return f"(({value}) + 1)"
+    return f"(({value}) + 1)"
 
 
-def _ir_condition_shape_candidates(function_ir) -> list[BranchCandidate]:
+def _ir_condition_shape_candidates(
+    function_ir,
+    type_catalog: CTypeCatalog | None = None,
+) -> list[BranchCandidate]:
     return _ir_condition_candidates(
         function_ir,
-        _ir_condition_ops(function_ir),
+        _ir_condition_ops(function_ir, type_catalog),
     )
 
 
-def _ir_condition_ops(function_ir) -> IrConditionOps:
-    return IrConditionOps(_safe_c_name, _nonmatching_value, _ir_decoded_field_aliases(function_ir), _host_to_network_fn)
+def _ir_condition_ops(
+    function_ir,
+    type_catalog: CTypeCatalog | None = None,
+) -> IrConditionOps:
+    pointer_like_types = (
+        frozenset(type_catalog.function_pointers)
+        if type_catalog is not None
+        else frozenset()
+    )
+    return IrConditionOps(
+        _safe_c_name,
+        _nonmatching_value,
+        _ir_decoded_field_aliases(function_ir),
+        _host_to_network_fn,
+        pointer_like_types,
+    )
 
 
 def _ir_state_switch_shape_candidates(
@@ -718,14 +751,65 @@ def _ir_lookup_shape_candidates(
     return _ir_lookup_candidates(function_ir, _ir_condition_ops(function_ir), helper_irs, helper_params)
 
 
-def _ownership_summary_from_ir(func: CFunction, function_ir):
+def _ownership_summary_from_ir(
+    func: CFunction,
+    function_ir,
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+):
     if function_ir is None:
         return None
-    return _ir_classify_ownership(
+    helper_ownership = _helper_ownership_index_map(helper_irs or {}, helper_params or {})
+    summary = _ir_classify_ownership(
         function_ir,
         {p.name for p in func.params if p.is_pointer},
         void_param_names={p.name for p in func.params if _is_void_star(p)},
+        helper_ownership=helper_ownership,
     )
+    if _function_name_consumes_first_pointer(func):
+        behavior = dict(summary.param_behavior)
+        for p in func.params:
+            if p.is_pointer:
+                behavior[p.name] = CONSUMED
+                break
+        summary = OwnershipSummary(
+            behavior,
+            summary.returns_owned_pointer,
+            summary.nullable_params,
+            summary.buffer_params,
+            summary.void_cast_types,
+        )
+    return summary
+
+
+def _function_name_consumes_first_pointer(func: CFunction) -> bool:
+    name = func.name.lower()
+    return (
+        name.endswith("_free")
+        or name.endswith("_destroy")
+        or name.endswith("_release")
+        or name.endswith("_delete")
+    )
+
+
+def _helper_ownership_index_map(
+    helper_irs: dict,
+    helper_params: dict[str, tuple[str, ...]],
+) -> dict[str, dict[int, str]]:
+    mapping: dict[str, dict[int, str]] = {}
+    for helper_name, helper_ir in helper_irs.items():
+        params = helper_params.get(helper_name, ())
+        if not params:
+            continue
+        facts = _ir_classify_ownership(helper_ir, set(params)).param_behavior
+        by_index: dict[int, str] = {}
+        for index, param_name in enumerate(params):
+            action = facts.get(param_name)
+            if action in {TRANSFERRED, CONSUMED}:
+                by_index[index] = action
+        if by_index:
+            mapping[helper_name] = by_index
+    return mapping
 
 
 def _source_branch_candidates(
@@ -760,6 +844,9 @@ def _source_branch_candidates(
     def ir_lookup_candidates(function_ir):
         return _ir_lookup_shape_candidates(function_ir, helper_irs, helper_params)
 
+    def ir_condition_candidates(function_ir):
+        return _ir_condition_shape_candidates(function_ir, type_catalog)
+
     return _branch_shaper_source_branch_candidates(
         func,
         source_text,
@@ -780,7 +867,7 @@ def _source_branch_candidates(
             _literal_or_macro_value,
             _safe_c_name,
             _is_void_star,
-            _ir_condition_shape_candidates,
+            ir_condition_candidates,
             _ir_callback_shape_candidates,
             ir_callee_candidates,
             ir_parser_candidates,
@@ -845,7 +932,9 @@ def _gen_null_setup_body(
     function_decls: dict[str, CFunction] | None = None,
     shaping_features: set[str] | None = None,
     function_ir = None,
-) -> tuple[list[str], list[str], list[str], list[str]]:
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+):
     return _bodygen_gen_null_setup_body(
         func,
         null_params,
@@ -855,7 +944,7 @@ def _gen_null_setup_body(
         function_decls,
         shaping_features,
         _bodygen_ops(),
-        _ownership_summary_from_ir(func, function_ir),
+        _ownership_summary_from_ir(func, function_ir, helper_irs, helper_params),
     )
 
 
@@ -923,7 +1012,12 @@ def _gen_valid_setup_body(
     call_arg_overrides = None,
     witness_setup = None,
     extra_outputs = None,
-) -> tuple[list[str], list[str], list[str], list[str]]:
+    post_state_facts = None,
+    fixture_requirements = None,
+    branch_facts = None,
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+):
     return _bodygen_gen_valid_setup_body(
         func,
         valid_params,
@@ -936,11 +1030,15 @@ def _gen_valid_setup_body(
         source_shape_oracle,
         source_shape_witnesses,
         _bodygen_ops(),
-        _ownership_summary_from_ir(func, function_ir),
+        _ownership_summary_from_ir(func, function_ir, helper_irs, helper_params),
+        function_ir,
         object_paths,
         call_arg_overrides,
         witness_setup,
         extra_outputs,
+        post_state_facts,
+        fixture_requirements,
+        branch_facts=branch_facts,
     )
 
 
@@ -952,7 +1050,9 @@ def _gen_mixed_test(
     function_decls: dict[str, CFunction] | None = None,
     shaping_features: set[str] | None = None,
     function_ir = None,
-) -> tuple[list[str], list[str], list[str], list[str]]:
+    helper_irs: dict | None = None,
+    helper_params: dict[str, tuple[str, ...]] | None = None,
+):
     return _bodygen_gen_mixed_test(
         func,
         behavior,
@@ -961,5 +1061,5 @@ def _gen_mixed_test(
         function_decls,
         shaping_features,
         _bodygen_ops(),
-        _ownership_summary_from_ir(func, function_ir),
+        _ownership_summary_from_ir(func, function_ir, helper_irs, helper_params),
     )

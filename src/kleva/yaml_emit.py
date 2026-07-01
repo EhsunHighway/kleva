@@ -42,6 +42,24 @@ def emit_fact_list(facts: list[dict[str, str]], indent_n: int = 6) -> str:
     return result.rstrip("\n")
 
 
+def emit_input_list(inputs: list[dict], indent_n: int = 6) -> str:
+    pad = " " * indent_n
+    child_pad = " " * (indent_n + 2)
+    if not inputs:
+        return "[]"
+    result = "\n"
+    for inp in inputs:
+        result += f"{pad}- ktest_name: {inp['ktest_name']}\n"
+        result += f"{child_pad}c_type:     {inp['c_type']}\n"
+        result += f"{child_pad}c_var:      {inp['c_var']}\n"
+        bounds = inp.get("bounds")
+        if bounds is not None:
+            result += f"{child_pad}bounds:\n"
+            result += f"{child_pad}  min: {bounds[0]}\n"
+            result += f"{child_pad}  max: {bounds[1]}\n"
+    return result.rstrip("\n")
+
+
 def emit_yaml_function(
     func: CFunction,
     behavior: ACSLBehavior,
@@ -56,6 +74,7 @@ def emit_yaml_function(
     target_branch:   str | None = None,
     candidate_origin: str | None = None,
     candidate_facts: list[dict[str, str]] | None = None,
+    inputs: list[dict] | None = None,
 ) -> list[str]:
     """Emit YAML lines for one function test entry."""
     preamble = preamble or []
@@ -73,7 +92,7 @@ def emit_yaml_function(
         f"  # {func.name} — behavior: {behavior.name}",
         f"  - name:      {ktest_dir.replace('klee_build/klee_out_', '')}",
         f"    ktest_dir: {ktest_dir}",
-        "    inputs:    []",
+        f"    inputs:    {emit_input_list(inputs or [])}",
     ]
     if preamble:
         lines.append(f"    preamble:  {emit_str_list(preamble)}")

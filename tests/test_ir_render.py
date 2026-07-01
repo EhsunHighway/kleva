@@ -26,6 +26,35 @@ class IrRenderTests(unittest.TestCase):
 
         self.assertEqual(assignable_expr(expr), "table->items[i]->state")
 
+    def test_renders_typed_array_subscript_struct_field_with_dot(self):
+        expr = FieldAccess(
+            ArraySubscript(
+                FieldAccess(VarRef("cache", "Cache *"), "pending", "PendingPacket[8]"),
+                IntLiteral(0),
+                "PendingPacket",
+            ),
+            "valid",
+            "int",
+        )
+
+        self.assertEqual(assignable_expr(expr), "cache->pending[0].valid")
+
+    def test_parenthesizes_address_of_base_before_field_access(self):
+        expr = FieldAccess(
+            AddressOf(
+                ArraySubscript(
+                    FieldAccess(VarRef("cache", "Cache *"), "pending", "PendingPacket[8]"),
+                    VarRef("i", "int"),
+                    "PendingPacket",
+                ),
+                "PendingPacket *",
+            ),
+            "valid",
+            "int",
+        )
+
+        self.assertEqual(assignable_expr(expr), "(&cache->pending[i])->valid")
+
     def test_renders_embedded_struct_field_with_dot(self):
         expr = FieldAccess(
             FieldAccess(VarRef("host", "Host *"), "base", "Device"),

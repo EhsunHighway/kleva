@@ -24,6 +24,20 @@ class RecipeTests(unittest.TestCase):
             "if (!ptr) return 0;",
         )
 
+    def test_address_of_guard_is_trivially_true(self):
+        self.assertEqual(
+            expand_guard("__GUARD__(&cache)", is_probe=True),
+            "(void)0;",
+        )
+        self.assertEqual(
+            expand_guard("__GUARD__((&cache))", is_probe=True, is_klee=True),
+            "(void)0;",
+        )
+        self.assertEqual(
+            expand_guard("__GUARD__((&cache))", is_probe=False),
+            "(void)0;",
+        )
+
     def test_probe_cleanup_guard_expands_to_assumption(self):
         self.assertEqual(
             expand_guard("__GUARD_WITH_CLEANUP__(ptr, cleanup(ptr);)", is_probe=True),

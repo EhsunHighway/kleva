@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from kleva.ir.model import ArraySubscript, BinaryOp, CallExpr, ExprStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, ReturnStmt, SourceLocation, UnaryOp, VarRef
+from kleva.ir.model import ArraySubscript, BinaryOp, CallExpr, CastExpr, DeclarationStmt, ExprStmt, FieldAccess, FunctionIR, IfStmt, IntLiteral, ReturnStmt, SourceLocation, UnaryOp, VarRef
 from kleva.fixtures.construction import safe_c_name
 from kleva.shaping.candidates import BranchFact, CallOutcomeFact
 from kleva.shaping.ir_parsers import HelperCallRule, IrParserOps, parser_candidates_from_ir
@@ -97,6 +97,57 @@ class IrParserShapingTests(unittest.TestCase):
                 ("ir_required_value_0_input_tag_ne_7_other", ["input->tag = 8;"]),
             ],
         )
+
+    def test_resolves_cast_alias_before_equality_guard(self):
+        func = FunctionIR(
+            "parse",
+            [
+                DeclarationStmt(
+                    "hdr",
+                    "Header *",
+                    CastExpr(
+                        "Header *",
+                        FieldAccess(VarRef("pkt", "Packet *"), "data", "uint8_t *"),
+                        "BitCast",
+                        "Header *",
+                    ),
+                ),
+                IfStmt(
+                    BinaryOp("==", FieldAccess(VarRef("hdr", "Header *"), "code"), IntLiteral(0)),
+                    [ReturnStmt(IntLiteral(-1))],
+                ),
+            ],
+        )
+
+        candidates = parser_candidates_from_ir(func, IrParserOps(safe_c_name))
+
+        self.assertEqual(
+            [(candidate.name, candidate.setup) for candidate in candidates],
+            [
+                ("ir_forbidden_value_0__Header_pkt_data_code_eq_0_forbidden", ["((Header *)pkt->data)->code = 0;"]),
+                ("ir_forbidden_value_0__Header_pkt_data_code_eq_0_allowed", ["((Header *)pkt->data)->code = 1;"]),
+            ],
+        )
+
+    def test_skips_equality_guard_on_function_local_result(self):
+        func = FunctionIR(
+            "parse",
+            [
+                DeclarationStmt(
+                    "res",
+                    "int",
+                    CallExpr("send", [VarRef("ctx", "Context *")]),
+                ),
+                IfStmt(
+                    BinaryOp("==", VarRef("res", "int"), IntLiteral(-1)),
+                    [ReturnStmt(IntLiteral(-1))],
+                ),
+            ],
+        )
+
+        candidates = parser_candidates_from_ir(func, IrParserOps(safe_c_name))
+
+        self.assertEqual(candidates, [])
 
     def test_handles_flipped_equality_guard(self):
         func = FunctionIR(
